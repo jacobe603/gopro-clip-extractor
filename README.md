@@ -26,6 +26,12 @@ Extracts clips using the analyzed metadata. Features:
 - Configurable timing (default: 8 sec before, 2 sec after highlight)
 - Files named with global order + clock time for sorting
 
+### `combine_clips.ps1`
+Concatenates all clips into a single highlight reel:
+- Uses ffmpeg concat demuxer (fast, no re-encoding)
+- Combines clips in filename order (chronological with our naming)
+- Outputs to parent folder with timestamp
+
 ### `extract_chapter_clips.ps1` / `extract_chapter_clips_fast.ps1`
 Standalone scripts for quick single-file extraction.
 
@@ -43,6 +49,10 @@ Standalone scripts for quick single-file extraction.
 4. **Extract clips**:
    ```powershell
    .\extract_clips.ps1
+   ```
+5. **Combine into highlight reel** (optional):
+   ```powershell
+   .\combine_clips.ps1 -InputFolder .\Clips
    ```
 
 ## Configuration
