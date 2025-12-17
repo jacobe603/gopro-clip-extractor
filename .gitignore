@@ -1,0 +1,36 @@
+# Video files
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.avi
+*.mkv
+
+# GoPro specific
+*.LRV
+*.THM
+
+# Output folders
+Clips/
+Clips1/
+Clips2/
+Clips3/
+
+# Generated metadata (contains local paths)
+chapters_metadata.json
+
+# FFmpeg metadata files (keep as examples but ignore local copies)
+FFMETADATAFILE*.txt
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# macOS
+.DS_Store
+
+# Claude Code
+.claude/
+
+# Misc
+nul
