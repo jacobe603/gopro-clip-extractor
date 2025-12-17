@@ -75,6 +75,34 @@ $periods = @(
 - PowerShell 5.1+
 - FFmpeg and FFprobe in PATH
 
+## Technical Notes
+
+### Two-Pass Seeking
+Early versions had issues with clips being cut short (0kb files or truncated clips). This was caused by ffmpeg's keyframe seeking when `-ss` is placed before `-i`.
+
+**Solution**: Two-pass seeking with 60-second buffer:
+```powershell
+$roughSeek = [Math]::Max(0, $clipStartSec - 60)  # Fast keyframe seek
+$fineSeek = $clipStartSec - $roughSeek           # Accurate frame seek
+
+ffmpeg -ss $roughSeek -i $video -ss $fineSeek -t $duration ...
+```
+
+### GoPro Timecode
+Original GoPro files (GX*.MP4) contain:
+- **Timecode track** (`tmcd`): SMPTE timecode from camera's real-time clock
+- **GPMF telemetry** (`gpmd`): GPS, accelerometer, gyroscope data
+
+Merged/re-encoded files lose this data. The scripts read timecodes from original files to map chapter markers to real clock time.
+
+### Chapter Extraction
+GoPro HiLight tags are stored as chapter markers. Extract with:
+```
+ffmpeg -i GX010060.MP4 -f ffmetadata FFMETADATAFILE.txt
+```
+
+Chapters appear as `START=` timestamps in milliseconds.
+
 ## Output Naming
 
 Clips are named for chronological sorting:
@@ -86,3 +114,11 @@ Clips are named for chronological sorting:
 ```
 
 Format: `{GlobalOrder}_{ClockTime}_{Period}_Ch{Number}.mp4`
+
+## Future Improvements
+
+- [ ] Make paths configurable via command-line parameters or config file
+- [ ] Auto-detect GoPro source files and match to periods by timestamp
+- [ ] Add transitions between clips in combined video
+- [ ] Support for multiple cameras/angles
+- [ ] GUI wrapper for non-technical users
