@@ -34,3 +34,8 @@ desktop.ini
 
 # Misc
 nul
+
+# Go GUI
+gui/bin/
+gui/*.exe
+*.exe
