@@ -477,7 +477,8 @@ func (f *FFmpeg) GetChapters(videoPath string) ([]ChapterInfo, error) {
 
 // ExportFullGame combines multiple MOV files into a single YouTube-ready video
 // with re-encoding and merged chapter markers
-func (f *FFmpeg) ExportFullGame(inputPaths []string, outputPath string, crf string, progress func(float64, string)) error {
+// If forceCPU is true, uses libx264 instead of NVENC for better compression efficiency
+func (f *FFmpeg) ExportFullGame(inputPaths []string, outputPath string, crf string, forceCPU bool, progress func(float64, string)) error {
 	if len(inputPaths) == 0 {
 		return fmt.Errorf("no input files")
 	}
@@ -573,11 +574,17 @@ func (f *FFmpeg) ExportFullGame(inputPaths []string, outputPath string, crf stri
 	// Step 4: Run ffmpeg with YouTube-optimized settings
 	progress(0.15, "Encoding video (this may take a while)...")
 
-	// Try NVENC first, fall back to CPU
-	err = f.exportFullGameNVENC(concatFile.Name(), metaFile.Name(), outputPath, crf)
-	if err != nil {
-		progress(0.15, "GPU encoding not available, using CPU...")
+	if forceCPU {
+		// User requested CPU encoding for better compression
+		progress(0.15, "Using CPU encoding for best compression...")
 		err = f.exportFullGameCPU(concatFile.Name(), metaFile.Name(), outputPath, crf)
+	} else {
+		// Try NVENC first, fall back to CPU
+		err = f.exportFullGameNVENC(concatFile.Name(), metaFile.Name(), outputPath, crf)
+		if err != nil {
+			progress(0.15, "GPU encoding not available, using CPU...")
+			err = f.exportFullGameCPU(concatFile.Name(), metaFile.Name(), outputPath, crf)
+		}
 	}
 
 	if err != nil {

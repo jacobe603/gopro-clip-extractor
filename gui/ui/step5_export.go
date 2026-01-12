@@ -36,6 +36,7 @@ func (a *App) createStep5Export() fyne.CanvasObject {
 		"High Quality (CRF 18) - ~12 Mbps",
 		"Balanced (CRF 20) - ~8 Mbps",
 		"Smaller File (CRF 23) - ~5 Mbps",
+		"Smallest (CPU, CRF 23) - ~5 Mbps, slower",
 	}, nil)
 	qualitySelect.SetSelected("Balanced (CRF 20) - ~8 Mbps")
 
@@ -135,6 +136,7 @@ func (a *App) createStep5Export() fyne.CanvasObject {
 
 		// Parse quality setting
 		crf := "20" // default balanced
+		forceCPU := false
 		switch qualitySelect.Selected {
 		case "High Quality (CRF 18) - ~12 Mbps":
 			crf = "18"
@@ -142,6 +144,9 @@ func (a *App) createStep5Export() fyne.CanvasObject {
 			crf = "20"
 		case "Smaller File (CRF 23) - ~5 Mbps":
 			crf = "23"
+		case "Smallest (CPU, CRF 23) - ~5 Mbps, slower":
+			crf = "23"
+			forceCPU = true
 		}
 
 		progressBar.Show()
@@ -150,7 +155,7 @@ func (a *App) createStep5Export() fyne.CanvasObject {
 
 		go func() {
 			// Export with chapter preservation
-			err := a.ff.ExportFullGame(movFiles, finalOutput, crf, func(progress float64, status string) {
+			err := a.ff.ExportFullGame(movFiles, finalOutput, crf, forceCPU, func(progress float64, status string) {
 				fyne.Do(func() {
 					progressBar.SetValue(progress)
 					statusLabel.SetText(status)
