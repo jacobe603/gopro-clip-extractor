@@ -14,8 +14,8 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-// createStep5 creates the combine clips UI
-func (a *App) createStep5() fyne.CanvasObject {
+// createStep4Combine creates the combine clips UI
+func (a *App) createStep4Combine() fyne.CanvasObject {
 	// Clips list
 	selectedClips := make(map[string]bool)
 	var checkboxes []*widget.Check
@@ -39,7 +39,7 @@ func (a *App) createStep5() fyne.CanvasObject {
 		selectedClips = make(map[string]bool)
 
 		if inputFolder == "" {
-			// Try to use extracted clips from step 3
+			// Try to use extracted clips from step 2
 			if len(a.extractedClips) > 0 {
 				for _, clip := range a.extractedClips {
 					clip := clip
@@ -55,7 +55,7 @@ func (a *App) createStep5() fyne.CanvasObject {
 				return
 			}
 
-			clipsContainer.Add(widget.NewLabel("No clips available. Either select an input folder or extract clips in Step 3."))
+			clipsContainer.Add(widget.NewLabel("No clips available. Either select an input folder or extract clips in Step 2."))
 			clipsContainer.Refresh()
 			return
 		}
@@ -112,10 +112,20 @@ func (a *App) createStep5() fyne.CanvasObject {
 		}, a.window)
 	})
 
-	useStep3Btn := widget.NewButton("Use Clips from Step 3", func() {
-		inputFolder = ""
-		inputFolderLabel.SetText("(using Step 3 clips)")
-		refreshClips()
+	useStep2Btn := widget.NewButton("Use Clips from Step 2", func() {
+		// Use the output folder from Step 2 (where clips were extracted to)
+		if a.cfg.LastOutputDir != "" {
+			inputFolder = a.cfg.LastOutputDir
+			inputFolderLabel.SetText(a.cfg.LastOutputDir)
+			refreshClips()
+		} else if len(a.extractedClips) > 0 {
+			// Fall back to in-memory list if no output dir saved
+			inputFolder = ""
+			inputFolderLabel.SetText("(using session clips)")
+			refreshClips()
+		} else {
+			statusLabel.SetText("No output folder from Step 2. Please select a folder.")
+		}
 	})
 
 	selectOutputBtn := widget.NewButton("Select Output File", func() {
@@ -208,7 +218,7 @@ func (a *App) createStep5() fyne.CanvasObject {
 				progressBar.Hide()
 				statusLabel.SetText(successMsg)
 				// Mark step complete
-				a.markStepComplete(4)
+				a.markStepComplete(3)
 			})
 		}()
 	})
@@ -221,7 +231,7 @@ func (a *App) createStep5() fyne.CanvasObject {
 		widget.NewLabel("Input:"),
 		inputFolderLabel,
 		selectInputBtn,
-		useStep3Btn,
+		useStep2Btn,
 	)
 
 	outputRow := container.NewHBox(
@@ -236,7 +246,7 @@ func (a *App) createStep5() fyne.CanvasObject {
 	scroll.SetMinSize(fyne.NewSize(0, 300))
 
 	return container.NewVBox(
-		widget.NewLabel("Step 5: Combine Clips into Highlight Reel"),
+		widget.NewLabel("Step 4: Combine Clips into Highlight Reel"),
 		widget.NewSeparator(),
 		inputRow,
 		outputRow,

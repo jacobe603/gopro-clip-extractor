@@ -31,8 +31,17 @@ func (a *Analyzer) AnalyzePeriods(periods []Period) (*AnalysisResult, error) {
 	periodChapters := make(map[string][]Chapter)
 
 	for _, period := range periods {
+		var chapters []Chapter
+		var err error
+
 		// Parse the metadata file for chapters
-		chapters, err := ParseFFMetadata(period.MetadataFile)
+		// If using MOV metadata and MetadataFile points to a video file, extract directly
+		if period.UseMovMetadata && period.MetadataFile == period.VideoFile {
+			// Extract chapters directly from the MOV file
+			chapters, err = a.extractChaptersFromVideo(period.VideoFile)
+		} else {
+			chapters, err = ParseFFMetadata(period.MetadataFile)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse metadata for %s: %w", period.Name, err)
 		}
@@ -41,8 +50,13 @@ func (a *Analyzer) AnalyzePeriods(periods []Period) (*AnalysisResult, error) {
 			continue // No chapters in this period
 		}
 
-		// Get the timecode from the source GoPro file
-		timecode, err := a.ff.GetTimecode(period.SourceGoPro)
+		// Get the timecode - use GetTimecodeFromVideo for MOV files, GetTimecode for original GoPro
+		var timecode string
+		if period.UseMovMetadata {
+			timecode, err = a.ff.GetTimecodeFromVideo(period.SourceGoPro)
+		} else {
+			timecode, err = a.ff.GetTimecode(period.SourceGoPro)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("failed to get timecode for %s: %w", period.Name, err)
 		}
@@ -112,6 +126,26 @@ func (result *AnalysisResult) GetPeriodVideoFile(periodName string) string {
 		}
 	}
 	return ""
+}
+
+// extractChaptersFromVideo extracts chapter markers directly from a video file using ffprobe
+func (a *Analyzer) extractChaptersFromVideo(videoPath string) ([]Chapter, error) {
+	// Create a temporary metadata file
+	tempFile, err := os.CreateTemp("", "ffmeta-*.txt")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp file: %w", err)
+	}
+	tempPath := tempFile.Name()
+	tempFile.Close()
+	defer os.Remove(tempPath)
+
+	// Extract metadata to temp file
+	if err := a.ff.ExtractMetadata(videoPath, tempPath); err != nil {
+		return nil, fmt.Errorf("failed to extract metadata: %w", err)
+	}
+
+	// Parse the temp file
+	return ParseFFMetadata(tempPath)
 }
 
 // ChapterJSON is a JSON-friendly version of Chapter for serialization

@@ -19,10 +19,10 @@ type App struct {
 	cfg     *config.Config
 
 	// Shared state between steps
-	extractedMetadataFiles []string          // Metadata files created in Step 1
-	periods                []metadata.Period // Periods configured in Step 2
+	workingFolder          string            // Working folder selected in Step 1
+	periods                []metadata.Period // Periods detected in Step 1
 	analysisResult         *metadata.AnalysisResult
-	extractedClips         []string // Clip files created in Step 3
+	extractedClips         []string // Clip files created in Step 2
 
 	// Tab references for status updates
 	tabs     *container.AppTabs
@@ -55,11 +55,11 @@ func (a *App) Run() {
 
 	// Create tab items and store references for status updates
 	a.tabItems = []*container.TabItem{
-		container.NewTabItem("1. Extract Metadata", a.createStep1()),
-		container.NewTabItem("2. Configure Periods", a.createStep2()),
-		container.NewTabItem("3. Extract Clips", a.createStep3()),
-		container.NewTabItem("4. Edit Clips", a.createStep4Edit()),
-		container.NewTabItem("5. Combine", a.createStep5()),
+		container.NewTabItem("1. Setup", a.createStep1Setup()),
+		container.NewTabItem("2. Extract Clips", a.createStep2Extract()),
+		container.NewTabItem("3. Edit Clips", a.createStep3Edit()),
+		container.NewTabItem("4. Combine", a.createStep4Combine()),
+		container.NewTabItem("5. Export Full Game", a.createStep5Export()),
 	}
 
 	// Create the tabbed interface
@@ -80,11 +80,11 @@ func (a *App) markStepComplete(stepIndex int) {
 		return
 	}
 	titles := []string{
-		"1. Extract Metadata",
-		"2. Configure Periods",
-		"3. Extract Clips",
-		"4. Edit Clips",
-		"5. Combine",
+		"1. Setup",
+		"2. Extract Clips",
+		"3. Edit Clips",
+		"4. Combine",
+		"5. Export Full Game",
 	}
 	a.tabItems[stepIndex].Text = titles[stepIndex] + " ✓"
 	a.tabs.Refresh()
@@ -96,11 +96,11 @@ func (a *App) markStepIncomplete(stepIndex int) {
 		return
 	}
 	titles := []string{
-		"1. Extract Metadata",
-		"2. Configure Periods",
-		"3. Extract Clips",
-		"4. Edit Clips",
-		"5. Combine",
+		"1. Setup",
+		"2. Extract Clips",
+		"3. Edit Clips",
+		"4. Combine",
+		"5. Export Full Game",
 	}
 	a.tabItems[stepIndex].Text = titles[stepIndex]
 	a.tabs.Refresh()

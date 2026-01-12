@@ -39,3 +39,4 @@ nul
 gui/bin/
 gui/*.exe
 *.exe
+*~

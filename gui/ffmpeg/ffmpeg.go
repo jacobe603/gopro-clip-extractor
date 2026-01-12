@@ -289,6 +289,118 @@ func (f *FFmpeg) ConcatClips(inputPaths []string, outputPath string) error {
 	return nil
 }
 
+// VideoMetadataInfo holds metadata information about a video file
+type VideoMetadataInfo struct {
+	HasTimecode   bool
+	Timecode      string
+	ChapterCount  int
+	HasChapters   bool
+	CreationTime  string
+	Duration      float64
+}
+
+// CheckVideoMetadata checks if a video file has preserved metadata (timecode, chapters)
+func (f *FFmpeg) CheckVideoMetadata(videoPath string) (*VideoMetadataInfo, error) {
+	info := &VideoMetadataInfo{}
+
+	// Get timecode from video stream tags
+	timecode, err := f.GetTimecodeFromVideo(videoPath)
+	if err == nil && timecode != "" {
+		info.HasTimecode = true
+		info.Timecode = timecode
+	}
+
+	// Get chapter count
+	chapters, err := f.GetChapterCount(videoPath)
+	if err == nil && chapters > 0 {
+		info.HasChapters = true
+		info.ChapterCount = chapters
+	}
+
+	// Get duration
+	duration, err := f.GetDuration(videoPath)
+	if err == nil {
+		info.Duration = duration
+	}
+
+	return info, nil
+}
+
+// GetTimecodeFromVideo extracts timecode from video stream tags (works with converted MOV files)
+func (f *FFmpeg) GetTimecodeFromVideo(videoPath string) (string, error) {
+	// First try video stream tags
+	cmd := exec.Command(f.ffprobePath,
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-show_entries", "stream_tags=timecode",
+		"-of", "csv=p=0",
+		videoPath,
+	)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err == nil {
+		timecode := strings.TrimSpace(stdout.String())
+		if timecode != "" {
+			return timecode, nil
+		}
+	}
+
+	// Fall back to format tags (some files store it there)
+	cmd = exec.Command(f.ffprobePath,
+		"-v", "error",
+		"-show_entries", "format_tags=timecode",
+		"-of", "csv=p=0",
+		videoPath,
+	)
+
+	stdout.Reset()
+	stderr.Reset()
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err == nil {
+		timecode := strings.TrimSpace(stdout.String())
+		if timecode != "" {
+			return timecode, nil
+		}
+	}
+
+	// Fall back to data stream (original GoPro files)
+	return f.GetTimecode(videoPath)
+}
+
+// GetChapterCount returns the number of chapters in a video file
+func (f *FFmpeg) GetChapterCount(videoPath string) (int, error) {
+	cmd := exec.Command(f.ffprobePath,
+		"-v", "error",
+		"-show_chapters",
+		"-of", "csv=p=0",
+		videoPath,
+	)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return 0, fmt.Errorf("ffprobe failed: %s", stderr.String())
+	}
+
+	// Count non-empty lines (each chapter produces output)
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	count := 0
+	for _, line := range lines {
+		if strings.TrimSpace(line) != "" {
+			count++
+		}
+	}
+
+	return count, nil
+}
+
 // ParseTimecode parses a timecode string "HH:MM:SS:FF" into total seconds
 // Assumes ~60fps (GoPro standard)
 func ParseTimecode(timecode string) (float64, error) {
@@ -309,4 +421,241 @@ func ParseTimecode(timecode string) (float64, error) {
 	totalSeconds := float64(hours*3600+minutes*60+seconds) + float64(frames)/fps
 
 	return totalSeconds, nil
+}
+
+// ChapterInfo holds chapter timing information
+type ChapterInfo struct {
+	StartMs int64
+	EndMs   int64
+	Title   string
+}
+
+// GetChapters extracts chapter information from a video file
+func (f *FFmpeg) GetChapters(videoPath string) ([]ChapterInfo, error) {
+	cmd := exec.Command(f.ffprobePath,
+		"-v", "error",
+		"-show_chapters",
+		"-print_format", "csv",
+		videoPath,
+	)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("ffprobe failed: %s", stderr.String())
+	}
+
+	var chapters []ChapterInfo
+	lines := strings.Split(stdout.String(), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.HasPrefix(line, "chapter,") {
+			continue
+		}
+		// Format: chapter,id,time_base,start,start_time,end,end_time,title
+		parts := strings.Split(line, ",")
+		if len(parts) >= 7 {
+			// start_time and end_time are in seconds as floats
+			startTime, _ := strconv.ParseFloat(parts[4], 64)
+			endTime, _ := strconv.ParseFloat(parts[6], 64)
+			title := ""
+			if len(parts) >= 8 {
+				title = parts[7]
+			}
+			chapters = append(chapters, ChapterInfo{
+				StartMs: int64(startTime * 1000),
+				EndMs:   int64(endTime * 1000),
+				Title:   title,
+			})
+		}
+	}
+
+	return chapters, nil
+}
+
+// ExportFullGame combines multiple MOV files into a single YouTube-ready video
+// with re-encoding and merged chapter markers
+func (f *FFmpeg) ExportFullGame(inputPaths []string, outputPath string, crf string, progress func(float64, string)) error {
+	if len(inputPaths) == 0 {
+		return fmt.Errorf("no input files")
+	}
+
+	// Step 1: Get durations and chapters from each file
+	progress(0.05, "Analyzing source files...")
+
+	var durations []float64
+	var allChapters []ChapterInfo
+	var totalDuration float64
+	periodNames := []string{"1st Period", "2nd Period", "3rd Period", "OT"}
+
+	for i, inputPath := range inputPaths {
+		// Get duration
+		dur, err := f.GetDuration(inputPath)
+		if err != nil {
+			return fmt.Errorf("failed to get duration of %s: %w", inputPath, err)
+		}
+		durations = append(durations, dur)
+
+		// Get chapters
+		chapters, _ := f.GetChapters(inputPath)
+
+		// Calculate time offset for this file
+		var offset float64
+		for j := 0; j < i; j++ {
+			offset += durations[j]
+		}
+
+		// Add period start marker
+		periodName := "Period"
+		if i < len(periodNames) {
+			periodName = periodNames[i]
+		} else {
+			periodName = fmt.Sprintf("Period %d", i+1)
+		}
+
+		allChapters = append(allChapters, ChapterInfo{
+			StartMs: int64(offset * 1000),
+			EndMs:   int64((offset + dur) * 1000),
+			Title:   periodName,
+		})
+
+		// Add HiLight chapters with offset
+		for j, ch := range chapters {
+			allChapters = append(allChapters, ChapterInfo{
+				StartMs: ch.StartMs + int64(offset*1000),
+				EndMs:   ch.EndMs + int64(offset*1000),
+				Title:   fmt.Sprintf("%s - Highlight %d", periodName, j+1),
+			})
+		}
+
+		totalDuration += dur
+	}
+
+	// Step 2: Create concat file list
+	progress(0.1, "Preparing files...")
+
+	concatFile, err := os.CreateTemp("", "ffmpeg-concat-*.txt")
+	if err != nil {
+		return fmt.Errorf("failed to create concat file: %w", err)
+	}
+	defer os.Remove(concatFile.Name())
+
+	for _, path := range inputPaths {
+		escapedPath := strings.ReplaceAll(path, "\\", "/")
+		escapedPath = strings.ReplaceAll(escapedPath, "'", "'\\''")
+		fmt.Fprintf(concatFile, "file '%s'\n", escapedPath)
+	}
+	concatFile.Close()
+
+	// Step 3: Create metadata file with chapters
+	metaFile, err := os.CreateTemp("", "ffmpeg-meta-*.txt")
+	if err != nil {
+		return fmt.Errorf("failed to create metadata file: %w", err)
+	}
+	defer os.Remove(metaFile.Name())
+
+	fmt.Fprintf(metaFile, ";FFMETADATA1\n")
+	fmt.Fprintf(metaFile, "title=Full Game\n")
+	fmt.Fprintf(metaFile, "\n")
+
+	for _, ch := range allChapters {
+		fmt.Fprintf(metaFile, "[CHAPTER]\n")
+		fmt.Fprintf(metaFile, "TIMEBASE=1/1000\n")
+		fmt.Fprintf(metaFile, "START=%d\n", ch.StartMs)
+		fmt.Fprintf(metaFile, "END=%d\n", ch.EndMs)
+		fmt.Fprintf(metaFile, "title=%s\n", ch.Title)
+		fmt.Fprintf(metaFile, "\n")
+	}
+	metaFile.Close()
+
+	// Step 4: Run ffmpeg with YouTube-optimized settings
+	progress(0.15, "Encoding video (this may take a while)...")
+
+	// Try NVENC first, fall back to CPU
+	err = f.exportFullGameNVENC(concatFile.Name(), metaFile.Name(), outputPath, crf)
+	if err != nil {
+		progress(0.15, "GPU encoding not available, using CPU...")
+		err = f.exportFullGameCPU(concatFile.Name(), metaFile.Name(), outputPath, crf)
+	}
+
+	if err != nil {
+		return err
+	}
+
+	progress(1.0, "Export complete!")
+	return nil
+}
+
+// exportFullGameNVENC exports using NVIDIA hardware encoding
+func (f *FFmpeg) exportFullGameNVENC(concatFile, metaFile, outputPath, crf string) error {
+	// Map CRF to NVENC QP (roughly equivalent)
+	qp := crf // QP values are similar to CRF for NVENC
+
+	cmd := exec.Command(f.ffmpegPath,
+		"-f", "concat",
+		"-safe", "0",
+		"-i", concatFile,
+		"-i", metaFile,
+		"-map", "0:v",
+		"-map", "0:a",
+		"-map_metadata", "1",
+		"-map_chapters", "1",
+		"-c:v", "h264_nvenc",
+		"-preset", "p4",
+		"-profile:v", "high",
+		"-rc", "constqp",
+		"-qp", qp,
+		"-pix_fmt", "yuv420p",
+		"-c:a", "aac",
+		"-ar", "48000",
+		"-b:a", "192k",
+		"-movflags", "+faststart", // YouTube optimization
+		"-y",
+		outputPath,
+	)
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("nvenc export failed: %s", stderr.String())
+	}
+
+	return nil
+}
+
+// exportFullGameCPU exports using software encoding
+func (f *FFmpeg) exportFullGameCPU(concatFile, metaFile, outputPath, crf string) error {
+	cmd := exec.Command(f.ffmpegPath,
+		"-f", "concat",
+		"-safe", "0",
+		"-i", concatFile,
+		"-i", metaFile,
+		"-map", "0:v",
+		"-map", "0:a",
+		"-map_metadata", "1",
+		"-map_chapters", "1",
+		"-c:v", "libx264",
+		"-preset", "medium",
+		"-profile:v", "high",
+		"-crf", crf,
+		"-pix_fmt", "yuv420p",
+		"-c:a", "aac",
+		"-ar", "48000",
+		"-b:a", "192k",
+		"-movflags", "+faststart", // YouTube optimization
+		"-y",
+		outputPath,
+	)
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("cpu export failed: %s", stderr.String())
+	}
+
+	return nil
 }

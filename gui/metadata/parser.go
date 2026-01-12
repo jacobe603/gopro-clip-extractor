@@ -23,10 +23,11 @@ type Chapter struct {
 
 // Period represents a recording period with associated files
 type Period struct {
-	Name         string
-	VideoFile    string
-	MetadataFile string
-	SourceGoPro  string
+	Name           string
+	VideoFile      string
+	MetadataFile   string
+	SourceGoPro    string
+	UseMovMetadata bool // If true, extract metadata from MOV file directly
 }
 
 // ParseFFMetadata parses an FFmpeg metadata file and extracts chapter markers
@@ -40,16 +41,35 @@ func ParseFFMetadata(path string) ([]Chapter, error) {
 	var chapters []Chapter
 	chapterNum := 0
 
-	// Regex to match START= lines
+	// Regex patterns
 	startRe := regexp.MustCompile(`^START=(\d+)`)
+	timebaseRe := regexp.MustCompile(`^TIMEBASE=1/(\d+)`)
+
+	// Default timebase: 1/1000 (milliseconds) for backward compatibility
+	// GoPro metadata uses 1/1000, but Shutter Encoder MOV uses 1/10000000
+	timebaseDenom := int64(1000)
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 
+		// Check for TIMEBASE line (appears before START in each [CHAPTER] block)
+		if matches := timebaseRe.FindStringSubmatch(line); matches != nil {
+			denom, _ := strconv.ParseInt(matches[1], 10, 64)
+			if denom > 0 {
+				timebaseDenom = denom
+			}
+			continue
+		}
+
 		if matches := startRe.FindStringSubmatch(line); matches != nil {
-			startMs, _ := strconv.ParseInt(matches[1], 10, 64)
+			startValue, _ := strconv.ParseInt(matches[1], 10, 64)
 			chapterNum++
+
+			// Convert to milliseconds based on timebase
+			// startValue is in units of 1/timebaseDenom seconds
+			// To get milliseconds: startValue * 1000 / timebaseDenom
+			startMs := (startValue * 1000) / timebaseDenom
 
 			chapters = append(chapters, Chapter{
 				Number:    chapterNum,

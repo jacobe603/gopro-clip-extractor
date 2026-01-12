@@ -13,8 +13,8 @@ import (
 	"gopro-gui/metadata"
 )
 
-// createStep3 creates the clip extraction UI
-func (a *App) createStep3() fyne.CanvasObject {
+// createStep2Extract creates the clip extraction UI
+func (a *App) createStep2Extract() fyne.CanvasObject {
 	// Chapter selection
 	selectedChapters := make(map[int]bool)
 	var checkboxes []*widget.Check
@@ -46,7 +46,7 @@ func (a *App) createStep3() fyne.CanvasObject {
 		selectedChapters = make(map[int]bool)
 
 		if a.analysisResult == nil || len(a.analysisResult.Chapters) == 0 {
-			chaptersContainer.Add(widget.NewLabel("No chapters available. Complete Step 2 first."))
+			chaptersContainer.Add(widget.NewLabel("No chapters available. Complete Step 1 first."))
 			chaptersContainer.Refresh()
 			return
 		}
@@ -112,7 +112,7 @@ func (a *App) createStep3() fyne.CanvasObject {
 
 	extractBtn := widget.NewButton("Extract Selected Clips", func() {
 		if a.analysisResult == nil || len(a.analysisResult.Chapters) == 0 {
-			a.showError("No Chapters", "Please complete Step 2 first to analyze chapters")
+			a.showError("No Chapters", "Please complete Step 1 first to analyze chapters")
 			return
 		}
 
@@ -215,7 +215,7 @@ func (a *App) createStep3() fyne.CanvasObject {
 				statusLabel.SetText(fmt.Sprintf("Done! Extracted %d clips to %s", finalCount, outputFolder))
 				// Mark step complete if we extracted at least one clip
 				if finalCount > 0 {
-					a.markStepComplete(2)
+					a.markStepComplete(1)
 				}
 			})
 		}()
@@ -249,7 +249,7 @@ func (a *App) createStep3() fyne.CanvasObject {
 	scroll.SetMinSize(fyne.NewSize(0, 300))
 
 	return container.NewVBox(
-		widget.NewLabel("Step 3: Select and Extract Clips"),
+		widget.NewLabel("Step 2: Select and Extract Clips"),
 		widget.NewSeparator(),
 		timingRow,
 		encodingRow,

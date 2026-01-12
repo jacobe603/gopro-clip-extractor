@@ -2,11 +2,15 @@ package ui
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 
 	"gopro-gui/metadata"
@@ -21,12 +25,28 @@ type clipEditEntry struct {
 	statusLabel *widget.Label
 }
 
-// createStep4Edit creates the clip editing UI
-func (a *App) createStep4Edit() fyne.CanvasObject {
+// createStep3Edit creates the clip editing UI
+func (a *App) createStep3Edit() fyne.CanvasObject {
 	var clipEntries []*clipEditEntry
 	clipsContainer := container.NewVBox()
 
 	statusLabel := widget.NewLabel("")
+
+	// Helper to match clip filename to chapter (handles both .mp4 and .mov)
+	matchClipToChapter := func(clipName string) *metadata.Chapter {
+		// Remove extension for comparison
+		clipBase := strings.TrimSuffix(clipName, filepath.Ext(clipName))
+
+		for i := range a.analysisResult.Chapters {
+			ch := &a.analysisResult.Chapters[i]
+			expectedName := metadata.GenerateClipFilename(*ch)
+			expectedBase := strings.TrimSuffix(expectedName, filepath.Ext(expectedName))
+			if clipBase == expectedBase {
+				return ch
+			}
+		}
+		return nil
+	}
 
 	// Refresh clips list from extracted clips
 	refreshClips := func() {
@@ -34,7 +54,7 @@ func (a *App) createStep4Edit() fyne.CanvasObject {
 		clipEntries = nil
 
 		if len(a.extractedClips) == 0 || a.analysisResult == nil {
-			clipsContainer.Add(widget.NewLabel("No clips available. Complete Step 3 first to extract clips."))
+			clipsContainer.Add(widget.NewLabel("No clips available. Complete Step 2 first, or use 'Load from Folder'."))
 			clipsContainer.Refresh()
 			return
 		}
@@ -43,16 +63,8 @@ func (a *App) createStep4Edit() fyne.CanvasObject {
 		for _, clipPath := range a.extractedClips {
 			clipName := filepath.Base(clipPath)
 
-			// Find matching chapter
-			var matchedChapter *metadata.Chapter
-			for i := range a.analysisResult.Chapters {
-				ch := &a.analysisResult.Chapters[i]
-				expectedName := metadata.GenerateClipFilename(*ch)
-				if clipName == expectedName {
-					matchedChapter = ch
-					break
-				}
-			}
+			// Find matching chapter (handles both .mp4 and .mov)
+			matchedChapter := matchClipToChapter(clipName)
 
 			if matchedChapter == nil {
 				continue
@@ -114,14 +126,57 @@ func (a *App) createStep4Edit() fyne.CanvasObject {
 		}
 
 		if len(clipEntries) == 0 {
-			clipsContainer.Add(widget.NewLabel("No clips found. Extract clips in Step 3 first."))
+			clipsContainer.Add(widget.NewLabel("No clips found. Extract clips in Step 2 first."))
 		}
 
 		clipsContainer.Refresh()
 	}
 
-	refreshBtn := widget.NewButton("Refresh Clip List", func() {
+	refreshBtn := widget.NewButton("Refresh", func() {
 		refreshClips()
+	})
+
+	// Load clips from a folder (for when clips were extracted in a previous session)
+	loadFromFolderBtn := widget.NewButton("Load from Folder", func() {
+		if a.analysisResult == nil {
+			a.showError("No Analysis", "Please complete Step 1 first to analyze periods")
+			return
+		}
+
+		dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
+			if err != nil || uri == nil {
+				return
+			}
+			folderPath := uri.Path()
+			if len(folderPath) > 2 && folderPath[0] == '/' && folderPath[2] == ':' {
+				folderPath = folderPath[1:]
+			}
+
+			// Scan folder for clip files (.mp4 and .mov)
+			entries, err := os.ReadDir(folderPath)
+			if err != nil {
+				a.showError("Error", "Failed to read folder: "+err.Error())
+				return
+			}
+
+			a.extractedClips = nil
+			for _, entry := range entries {
+				if entry.IsDir() {
+					continue
+				}
+				ext := strings.ToLower(filepath.Ext(entry.Name()))
+				if ext == ".mp4" || ext == ".mov" {
+					clipPath := filepath.Join(folderPath, entry.Name())
+					// Only add if it matches a chapter
+					if matchClipToChapter(entry.Name()) != nil {
+						a.extractedClips = append(a.extractedClips, clipPath)
+					}
+				}
+			}
+
+			statusLabel.SetText(fmt.Sprintf("Loaded %d clips from folder", len(a.extractedClips)))
+			refreshClips()
+		}, a.window)
 	})
 
 	reExtractAllBtn := widget.NewButton("Re-Extract All With New Timings", func() {
@@ -138,7 +193,7 @@ func (a *App) createStep4Edit() fyne.CanvasObject {
 				fyne.Do(func() {
 					statusLabel.SetText(progress)
 				})
-				a.reExtractClip(ce)
+				a.reExtractClipSync(ce)
 			}
 
 			fyne.Do(func() {
@@ -159,10 +214,10 @@ func (a *App) createStep4Edit() fyne.CanvasObject {
 	helpText.Wrapping = fyne.TextWrapWord
 
 	header := container.NewVBox(
-		widget.NewLabel("Step 4: Edit Clips"),
+		widget.NewLabel("Step 3: Edit Clips"),
 		widget.NewSeparator(),
 		helpText,
-		container.NewHBox(refreshBtn, reExtractAllBtn),
+		container.NewHBox(refreshBtn, loadFromFolderBtn, reExtractAllBtn),
 		widget.NewSeparator(),
 	)
 
@@ -174,8 +229,31 @@ func (a *App) createStep4Edit() fyne.CanvasObject {
 	return container.NewBorder(header, footer, nil, nil, scroll)
 }
 
-// reExtractClip re-extracts a single clip with updated timing
+// reExtractClip re-extracts a single clip with updated timing (runs async for UI responsiveness)
 func (a *App) reExtractClip(ce *clipEditEntry) {
+	// Immediately show "Extracting..." status
+	ce.statusLabel.SetText("Extracting...")
+	ce.statusLabel.Refresh()
+
+	// Run extraction in background so UI stays responsive
+	go func() {
+		a.doExtractClip(ce)
+	}()
+}
+
+// reExtractClipSync re-extracts a single clip synchronously (for batch operations)
+func (a *App) reExtractClipSync(ce *clipEditEntry) {
+	// Show "Extracting..." status
+	fyne.Do(func() {
+		ce.statusLabel.SetText("Extracting...")
+		ce.statusLabel.Refresh()
+	})
+
+	a.doExtractClip(ce)
+}
+
+// doExtractClip performs the actual extraction work
+func (a *App) doExtractClip(ce *clipEditEntry) {
 	// Parse timing values
 	secBefore, err := strconv.ParseFloat(ce.beforeEntry.Text, 64)
 	if err != nil {
@@ -202,18 +280,17 @@ func (a *App) reExtractClip(ce *clipEditEntry) {
 	}
 	duration := secBefore + secAfter
 
-	fyne.Do(func() {
-		ce.statusLabel.SetText("Extracting...")
-	})
-
 	// Extract the clip (overwrites existing)
 	err = a.ff.ExtractClip(videoFile, ce.clipPath, startSec, duration)
 
+	// Show completion with timestamp so user knows it's a fresh extraction
 	fyne.Do(func() {
 		if err != nil {
 			ce.statusLabel.SetText("Error: " + err.Error())
 		} else {
-			ce.statusLabel.SetText("Done!")
+			timestamp := time.Now().Format("15:04:05")
+			ce.statusLabel.SetText(fmt.Sprintf("Done! (%s)", timestamp))
 		}
+		ce.statusLabel.Refresh()
 	})
 }
