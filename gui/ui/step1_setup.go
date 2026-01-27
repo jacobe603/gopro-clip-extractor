@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -36,10 +37,106 @@ type detectedPeriodInfo struct {
 	ready          bool
 }
 
+// splitGoProGroup holds information about split GoPro files
+type splitGoProGroup struct {
+	videoID  string   // e.g., "0092"
+	prefix   string   // e.g., "GX" or "GH"
+	fileType string   // "MP4" or "MOV"
+	files    []string // sorted by sequence: [GX010092.MP4, GX020092.MP4]
+	combined bool     // true if already combined
+}
+
+// detectSplitGoProFiles scans a folder for split GoPro file groups
+// Returns groups that have 2+ files with the same video ID
+// Detects both original MP4 files and converted MOV files
+func detectSplitGoProFiles(folderPath string) ([]splitGoProGroup, error) {
+	entries, err := os.ReadDir(folderPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Pattern: GX##XXXX.MP4/mp4/MOV/mov or GH##XXXX.MP4/mp4/MOV/mov
+	// Group 1: prefix (GX/GH)
+	// Group 2: sequence number (01, 02, ...)
+	// Group 3: video ID (0092, etc.)
+	// Group 4: extension
+	pattern := regexp.MustCompile(`^(GX|GH)(\d{2})(\d{4})\.(MP4|mp4|MOV|mov)$`)
+
+	// Map: prefix+videoID+ext -> list of (sequence, filename)
+	type fileInfo struct {
+		sequence string
+		filename string
+		fullPath string
+	}
+	groups := make(map[string][]fileInfo)
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		matches := pattern.FindStringSubmatch(name)
+		if matches == nil {
+			continue
+		}
+
+		prefix := matches[1]
+		sequence := matches[2]
+		videoID := matches[3]
+		ext := strings.ToUpper(matches[4])
+		key := prefix + "_" + videoID + "_" + ext
+
+		groups[key] = append(groups[key], fileInfo{
+			sequence: sequence,
+			filename: name,
+			fullPath: filepath.Join(folderPath, name),
+		})
+	}
+
+	// Build result: only groups with 2+ files
+	var result []splitGoProGroup
+	for key, files := range groups {
+		if len(files) < 2 {
+			continue
+		}
+
+		// Sort by sequence
+		sort.Slice(files, func(i, j int) bool {
+			return files[i].sequence < files[j].sequence
+		})
+
+		parts := strings.Split(key, "_")
+		prefix := parts[0]
+		videoID := parts[1]
+		fileType := parts[2]
+
+		var filePaths []string
+		for _, f := range files {
+			filePaths = append(filePaths, f.fullPath)
+		}
+
+		result = append(result, splitGoProGroup{
+			videoID:  videoID,
+			prefix:   prefix,
+			fileType: fileType,
+			files:    filePaths,
+		})
+	}
+
+	// Sort by video ID
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].videoID < result[j].videoID
+	})
+
+	return result, nil
+}
+
 // createStep1Setup creates the setup/folder detection UI
 func (a *App) createStep1Setup() fyne.CanvasObject {
 	var detectedPeriods []*detectedPeriodInfo
 	var workingFolder string
+	var splitGroups []splitGoProGroup
+	var splitCheckboxes []*widget.Check
 
 	// UI elements
 	folderLabel := widget.NewLabel("No folder selected")
@@ -54,6 +151,17 @@ func (a *App) createStep1Setup() fyne.CanvasObject {
 	periodsContainer := container.NewVBox()
 	periodsScroll := container.NewScroll(periodsContainer)
 	periodsScroll.SetMinSize(fyne.NewSize(0, 250))
+
+	// Split GoPro files UI elements
+	splitContainer := container.NewVBox()
+	splitSection := container.NewVBox()
+	splitSection.Hide()
+
+	combineBtn := widget.NewButton("Combine Selected", nil)
+	combineBtn.Disable()
+
+	combineProgressBar := widget.NewProgressBar()
+	combineProgressBar.Hide()
 
 	extractBtn := widget.NewButton("Extract Metadata from GoPro Files", nil)
 	extractBtn.Hide()
@@ -71,14 +179,20 @@ func (a *App) createStep1Setup() fyne.CanvasObject {
 	scanFolder := func(folderPath string) {
 		// Clear previous results and show scanning indicator
 		detectedPeriods = nil
+		splitGroups = nil
+		splitCheckboxes = nil
 		periodsContainer.Objects = nil
 		periodsContainer.Refresh()
+		splitContainer.Objects = nil
+		splitContainer.Refresh()
+		splitSection.Hide()
 		filesFoundLabel.SetText("")
 		statusLabel.SetText("Scanning folder...")
 		scanProgressBar.SetValue(0)
 		scanProgressBar.Show()
 		analyzeBtn.Disable()
 		extractBtn.Hide()
+		combineBtn.Disable()
 
 		go func() {
 			entries, err := os.ReadDir(folderPath)
@@ -89,6 +203,9 @@ func (a *App) createStep1Setup() fyne.CanvasObject {
 				})
 				return
 			}
+
+			// Detect split GoPro files
+			detectedSplitGroups, _ := detectSplitGoProFiles(folderPath)
 
 			// First pass: count video files and collect metadata files (fast)
 			var videoFiles []struct {
@@ -177,6 +294,51 @@ func (a *App) createStep1Setup() fyne.CanvasObject {
 				scanProgressBar.SetValue(1.0)
 				filesFoundLabel.SetText(fmt.Sprintf("Found: %d MOV files, %d MP4 files, %d metadata files",
 					len(movFiles), len(mp4Files), len(metaFiles)))
+
+				// Show split GoPro files section if any detected
+				splitGroups = detectedSplitGroups
+				splitCheckboxes = nil
+				splitContainer.Objects = nil
+
+				if len(splitGroups) > 0 {
+					splitContainer.Add(widget.NewLabel(fmt.Sprintf("Found %d split video groups:", len(splitGroups))))
+
+					for i := range splitGroups {
+						group := &splitGroups[i]
+						// Build file list string
+						var fileNames []string
+						for _, f := range group.files {
+							fileNames = append(fileNames, filepath.Base(f))
+						}
+						filesStr := strings.Join(fileNames, ", ")
+
+						checkText := fmt.Sprintf("[%s] Video %s (%d parts: %s)", group.fileType, group.videoID, len(group.files), filesStr)
+						check := widget.NewCheck(checkText, func(checked bool) {
+							// Update combine button state
+							anyChecked := false
+							for _, cb := range splitCheckboxes {
+								if cb.Checked {
+									anyChecked = true
+									break
+								}
+							}
+							if anyChecked {
+								combineBtn.Enable()
+							} else {
+								combineBtn.Disable()
+							}
+						})
+						check.SetChecked(true)
+						splitCheckboxes = append(splitCheckboxes, check)
+						splitContainer.Add(check)
+					}
+
+					combineBtn.Enable()
+					splitSection.Show()
+				} else {
+					splitSection.Hide()
+				}
+				splitContainer.Refresh()
 
 				if len(movFiles) == 0 {
 					statusLabel.SetText("No MOV files found. Please select a folder with converted video files.")
@@ -359,6 +521,58 @@ func (a *App) createStep1Setup() fyne.CanvasObject {
 		}()
 	}
 
+	// Combine split files button
+	combineBtn.OnTapped = func() {
+		if workingFolder == "" || len(splitGroups) == 0 {
+			return
+		}
+
+		// Get selected groups
+		var toCombine []splitGoProGroup
+		for i, cb := range splitCheckboxes {
+			if cb.Checked && i < len(splitGroups) {
+				toCombine = append(toCombine, splitGroups[i])
+			}
+		}
+
+		if len(toCombine) == 0 {
+			return
+		}
+
+		combineBtn.Disable()
+		combineProgressBar.Show()
+		combineProgressBar.SetValue(0)
+
+		go func() {
+			for i, group := range toCombine {
+				fyne.Do(func() {
+					combineProgressBar.SetValue(float64(i) / float64(len(toCombine)))
+					statusLabel.SetText(fmt.Sprintf("Combining %d/%d: %s Video %s (%d parts)...",
+						i+1, len(toCombine), group.fileType, group.videoID, len(group.files)))
+				})
+
+				// Output filename: {prefix}_combined_{videoID}.{ext}
+				outputPath := filepath.Join(workingFolder,
+					fmt.Sprintf("%s_combined_%s.%s", group.prefix, group.videoID, group.fileType))
+
+				err := a.ff.CombineSplitGoPro(group.files, outputPath)
+				if err != nil {
+					fyne.Do(func() {
+						statusLabel.SetText(fmt.Sprintf("Error combining video %s: %s", group.videoID, err.Error()))
+					})
+				}
+			}
+
+			fyne.Do(func() {
+				combineProgressBar.SetValue(1.0)
+				combineProgressBar.Hide()
+				combineBtn.Enable()
+				statusLabel.SetText(fmt.Sprintf("Combined %d video groups. Rescanning folder...", len(toCombine)))
+				scanFolder(workingFolder) // Refresh to show new combined files
+			})
+		}()
+	}
+
 	// Analyze & Continue button
 	analyzeBtn.OnTapped = func() {
 		if len(detectedPeriods) == 0 {
@@ -426,6 +640,14 @@ func (a *App) createStep1Setup() fyne.CanvasObject {
 	// Layout
 	folderRow := container.NewBorder(nil, nil, widget.NewLabel("Working Folder:"), container.NewHBox(selectFolderBtn, refreshBtn), folderLabel)
 
+	// Build split section UI
+	splitSection.Objects = []fyne.CanvasObject{
+		widget.NewSeparator(),
+		widget.NewLabel("Split GoPro Files"),
+		splitContainer,
+		container.NewHBox(combineBtn, combineProgressBar),
+	}
+
 	header := container.NewVBox(
 		widget.NewLabel("Step 1: Setup"),
 		widget.NewSeparator(),
@@ -433,6 +655,9 @@ func (a *App) createStep1Setup() fyne.CanvasObject {
 		folderRow,
 		widget.NewSeparator(),
 		filesFoundLabel,
+		splitSection,
+		widget.NewSeparator(),
+		widget.NewLabel("Detected Periods"),
 	)
 
 	extractRow := container.NewVBox(

@@ -6,8 +6,10 @@ A Windows GUI application for extracting highlight clips from GoPro footage usin
 
 - **Smart folder detection** - Auto-detects MOV, MP4, and metadata files
 - **Auto-period creation** - Automatically creates periods based on MOV files found
+- **Split file detection** - Detects and combines split GoPro recordings (GX010092 + GX020092)
 - **HiLight tag extraction** - Reads GoPro chapter markers (HiLight button presses)
 - **Real-world timestamps** - Maps chapter markers to actual clock time for chronological sorting
+- **Overlap detection** - Automatically merges overlapping highlights to avoid repeated video
 - **Flexible clip extraction** - Configurable seconds before/after each highlight
 - **Two extraction modes** - Fast stream copy or re-encode with rotation/flip
 - **Clip editing** - Adjust timing and re-extract individual clips
@@ -75,8 +77,22 @@ Select your working folder containing the video files. The app automatically:
 - Scans for MP4 files (original GoPro files)
 - Scans for existing `_metadata.txt` files
 - Checks each file for timecode and chapter markers
+- **Detects split GoPro recordings** (see below)
 - Auto-creates periods based on MOV files found
 - Shows progress during scanning
+
+**Split GoPro File Detection:**
+
+GoPro cameras automatically split long recordings into multiple files (e.g., when exceeding 4GB). The app detects these split files by their naming pattern:
+- Pattern: `GX##XXXX.MP4` or `GH##XXXX.MP4` (also `.MOV`)
+- Example: `GX010092.MP4` + `GX020092.MP4` are parts 1 and 2 of video 0092
+
+When split files are detected:
+1. The app shows a "Split GoPro Files" section
+2. Select which groups to combine (pre-checked by default)
+3. Click "Combine Selected" to merge into single files
+4. Chapter markers (HiLights) are preserved and merged with correct timestamps
+5. Output: `GX_combined_0092.MP4` (or `.MOV`)
 
 **Metadata detection:**
 - If MOV has preserved chapters → Ready to use
@@ -94,6 +110,18 @@ Click **Analyze & Continue** when all periods show ready status.
   - **Stream Copy (Fast)** - No re-encoding, preserves quality
   - **Re-encode** - Allows rotation, flipping, quality adjustment
 - Extract clips with progress tracking
+
+**Automatic Overlap Detection:**
+
+When highlights are close together, their clips would contain repeated video. For example, with 2s before and 8s after (10s total):
+- Highlight 1 at 1:03 → clip from 1:01 to 1:11
+- Highlight 2 at 1:07 → clip from 1:05 to 1:15
+- Without merging: 6 seconds of video would repeat
+
+The app automatically detects these overlaps and merges them into a single longer clip:
+- Merged clip: 1:01 to 1:15 (14 seconds, covers both highlights)
+- Status shows: "2 overlapping highlight groups detected (4 highlights merged into 2 clips)"
+- Output filename: `150405_1Period_Ch03-04.mp4` (indicates merged range)
 
 ### Step 3: Edit Clips
 
@@ -205,19 +233,116 @@ First seek is fast (keyframe), second is accurate (frame).
 - Uses NVIDIA NVENC when available
 - Falls back to CPU (libx264) automatically
 
+### Overlap Detection Algorithm
+When extracting clips, the app detects overlapping highlights to avoid repeated video:
+
+1. Groups chapters by period (can't merge across different video files)
+2. Sorts chapters by video time within each period
+3. Checks if each chapter's clip start overlaps with the previous group's end
+4. Merges overlapping chapters into single `ClipGroup` with extended duration
+
+**Overlap condition:** `next_chapter_time - before_padding < current_group_end_time`
+
+**Future extension (Option B):** The code in `gui/metadata/overlap.go` is documented to support user choice between auto-merge (current) and manual merge with warnings. See `OverlapInfo` field and `CalculateRecommendedAfterTime()` function.
+
 ## Building from Source
+
+### Quick Build (Recommended)
+
+From the project root:
+```cmd
+build.bat
+```
+
+This script:
+- Sets `CGO_ENABLED=1` (required for Fyne GUI framework)
+- Configures MSYS2 MinGW GCC compiler path
+- Builds `gopro-gui.exe` in the project root
+
+### Manual Build
 
 ```powershell
 cd gui
-.\build.bat
+$env:CGO_ENABLED=1
+$env:CC = "C:\msys64\mingw64\bin\gcc.exe"
+$env:PATH = "C:\msys64\mingw64\bin;" + $env:PATH
+go build -o ..\gopro-gui.exe .
 ```
 
-Or manually:
-```powershell
-$env:CGO_ENABLED=1
-$env:PATH = "C:\msys64\mingw64\bin;" + $env:PATH
-go build -o gopro-gui.exe
+### Prerequisites for Building
+
+1. **Go 1.21+** - Install via `winget install GoLang.Go`
+2. **MSYS2 with MinGW-w64** - Required for CGO compilation
+   - Install MSYS2 from https://www.msys2.org/
+   - Run in MSYS2: `pacman -S mingw-w64-x86_64-gcc`
+3. **FFmpeg** - Place in `bin/` folder or install via `winget install Gyan.FFmpeg`
+
+## Technical Notes
+
+### GoPro Metadata
+- **Timecode track** (`tmcd`): Real-time clock from camera
+- **GPMF telemetry** (`gpmd`): GPS, accelerometer data
+- **Chapter markers**: HiLight button presses stored as chapters
+
+### TIMEBASE Handling
+GoPro metadata uses `TIMEBASE=1/10000000`. The parser correctly handles this by dividing START values by the timebase denominator to get seconds.
+
+### Two-Pass Seeking
+For accurate clip extraction:
 ```
+ffmpeg -ss [rough] -i video -ss [fine] -t duration ...
+```
+First seek is fast (keyframe), second is accurate (frame).
+
+### Hardware Acceleration
+- Uses NVIDIA NVENC when available
+- Falls back to CPU (libx264) automatically
+
+### FFmpeg Filter Complex for Video Combining
+
+When combining clips or exporting full games, the app uses FFmpeg's `filter_complex` instead of the concat demuxer. This handles two common issues:
+
+**1. Unknown streams in DNxHR MOV files:**
+Shutter Encoder's DNxHR output includes metadata streams (timecode, subtitles) that the concat demuxer can't handle:
+```
+[concat] Could not find codec parameters for stream 3 (Unknown: none)
+```
+
+**2. Different resolutions between clips:**
+Clips extracted from different source files may have slightly different resolutions, causing concat filter failures:
+```
+[Parsed_concat_0] Input link parameters (1831x1030) do not match output (1855x1043)
+```
+
+**Solution:** The app builds a filter_complex that:
+- Explicitly selects only video `[N:v]` and audio `[N:a]` streams (ignores unknown streams)
+- Scales all videos to 1920x1080 with letterboxing for consistent dimensions
+- Concatenates the normalized streams
+
+```
+[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[v0];
+[1:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[v1];
+[v0][0:a][v1][1:a]concat=n=2:v=1:a=1[outv][outa]
+```
+
+### Overlap Detection Algorithm
+When extracting clips, the app detects overlapping highlights to avoid repeated video:
+
+1. Groups chapters by period (can't merge across different video files)
+2. Sorts chapters by video time within each period
+3. Checks if each chapter's clip start overlaps with the previous group's end
+4. Merges overlapping chapters into single `ClipGroup` with extended duration
+
+**Overlap condition:** `next_chapter_time - before_padding < current_group_end_time`
+
+**Future extension (Option B):** The code in `gui/metadata/overlap.go` is documented to support user choice between auto-merge (current) and manual merge with warnings. See `OverlapInfo` field and `CalculateRecommendedAfterTime()` function.
+
+## Changelog
+
+### 2025-01-27
+- **Fixed:** Step 4 Combine now handles clips with different resolutions by scaling to 1920x1080
+- **Fixed:** Step 5 Export Full Game now works with DNxHR MOV files (handles unknown streams)
+- **Added:** Split GoPro file detection and combining in Step 1
 
 ## License
 

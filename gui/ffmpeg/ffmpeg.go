@@ -16,6 +16,10 @@ import (
 type FFmpeg struct {
 	ffmpegPath  string
 	ffprobePath string
+	// currentCmd holds the currently running long operation (for cancellation)
+	currentCmd *exec.Cmd
+	// cancelFlag indicates if the current operation should be cancelled
+	cancelFlag bool
 }
 
 // New creates a new FFmpeg wrapper, looking for binaries in the bin/ folder
@@ -29,9 +33,9 @@ func New() (*FFmpeg, error) {
 
 	// Try multiple locations for ffmpeg
 	searchPaths := []string{
-		filepath.Join(exeDir, "bin"),           // Next to executable
-		filepath.Join(exeDir, "..", "bin"),     // Parent/bin (for development)
-		"bin",                                   // Relative to working directory
+		filepath.Join(exeDir, "bin"),       // Next to executable
+		filepath.Join(exeDir, "..", "bin"), // Parent/bin (for development)
+		"bin",                              // Relative to working directory
 	}
 
 	var ffmpegPath, ffprobePath string
@@ -68,6 +72,26 @@ func New() (*FFmpeg, error) {
 		ffmpegPath:  ffmpegPath,
 		ffprobePath: ffprobePath,
 	}, nil
+}
+
+// CancelExport cancels any currently running export operation
+func (f *FFmpeg) CancelExport() error {
+	f.cancelFlag = true
+	if f.currentCmd != nil && f.currentCmd.Process != nil {
+		return f.currentCmd.Process.Kill()
+	}
+	return nil
+}
+
+// IsCancelled returns true if the current operation was cancelled
+func (f *FFmpeg) IsCancelled() bool {
+	return f.cancelFlag
+}
+
+// ResetCancel resets the cancel flag for a new operation
+func (f *FFmpeg) ResetCancel() {
+	f.cancelFlag = false
+	f.currentCmd = nil
 }
 
 // ExtractMetadata extracts chapter metadata from a video file using ffmpeg
@@ -171,13 +195,13 @@ func (f *FFmpeg) extractClipNVENC(inputPath, outputPath string, roughSeek, fineS
 		"-ss", fmt.Sprintf("%.3f", fineSeek),
 		"-t", fmt.Sprintf("%.3f", durationSec),
 		"-c:v", "h264_nvenc",
-		"-preset", "p4",        // Good balance of speed/quality (p1=fastest, p7=slowest)
-		"-profile:v", "high",   // H.264 High profile for HD content
-		"-rc", "constqp",       // Constant quality mode
-		"-qp", "18",            // Quality level (similar to CRF 18)
-		"-pix_fmt", "yuv420p",  // Standard pixel format for compatibility
+		"-preset", "p4", // Good balance of speed/quality (p1=fastest, p7=slowest)
+		"-profile:v", "high", // H.264 High profile for HD content
+		"-rc", "constqp", // Constant quality mode
+		"-qp", "18", // Quality level (similar to CRF 18)
+		"-pix_fmt", "yuv420p", // Standard pixel format for compatibility
 		"-c:a", "aac",
-		"-ar", "48000",         // 48kHz audio (YouTube recommended)
+		"-ar", "48000", // 48kHz audio (YouTube recommended)
 		"-b:a", "192k",
 		"-y",
 		outputPath,
@@ -201,12 +225,12 @@ func (f *FFmpeg) extractClipCPU(inputPath, outputPath string, roughSeek, fineSee
 		"-ss", fmt.Sprintf("%.3f", fineSeek),
 		"-t", fmt.Sprintf("%.3f", durationSec),
 		"-c:v", "libx264",
-		"-preset", "medium",    // Good balance of speed/quality
-		"-profile:v", "high",   // H.264 High profile for HD content
+		"-preset", "medium", // Good balance of speed/quality
+		"-profile:v", "high", // H.264 High profile for HD content
 		"-crf", "18",
-		"-pix_fmt", "yuv420p",  // Standard pixel format for compatibility
+		"-pix_fmt", "yuv420p", // Standard pixel format for compatibility
 		"-c:a", "aac",
-		"-ar", "48000",         // 48kHz audio (YouTube recommended)
+		"-ar", "48000", // 48kHz audio (YouTube recommended)
 		"-b:a", "192k",
 		"-y",
 		outputPath,
@@ -228,9 +252,9 @@ func (f *FFmpeg) ExtractClipStreamCopy(inputPath, outputPath string, startSec, d
 		"-ss", fmt.Sprintf("%.3f", startSec),
 		"-i", inputPath,
 		"-t", fmt.Sprintf("%.3f", durationSec),
-		"-c", "copy",       // No re-encoding
-		"-map", "0:v",      // Only video
-		"-map", "0:a",      // Only audio
+		"-c", "copy", // No re-encoding
+		"-map", "0:v", // Only video
+		"-map", "0:a", // Only audio
 		"-y",
 		outputPath,
 	)
@@ -245,36 +269,285 @@ func (f *FFmpeg) ExtractClipStreamCopy(inputPath, outputPath string, startSec, d
 	return nil
 }
 
+// ClipChapter holds chapter information for embedding in extracted clips
+type ClipChapter struct {
+	OffsetMs int64  // Position in milliseconds from clip start
+	Title    string // Chapter title
+}
+
+// ExtractClipWithChapters extracts a clip with embedded chapter markers
+// Uses two-pass seeking for accuracy and embeds chapter metadata
+func (f *FFmpeg) ExtractClipWithChapters(inputPath, outputPath string, startSec, durationSec float64, chapters []ClipChapter) error {
+	// Two-pass seeking: rough seek to 60 seconds before, then fine seek
+	roughSeek := startSec - 60
+	if roughSeek < 0 {
+		roughSeek = 0
+	}
+	fineSeek := startSec - roughSeek
+
+	// Create metadata file with chapters
+	metaFile, err := os.CreateTemp("", "ffmpeg-clip-meta-*.txt")
+	if err != nil {
+		return fmt.Errorf("failed to create metadata file: %w", err)
+	}
+	defer os.Remove(metaFile.Name())
+
+	fmt.Fprintf(metaFile, ";FFMETADATA1\n\n")
+
+	durationMs := int64(durationSec * 1000)
+	for i, ch := range chapters {
+		// Calculate end time (next chapter start or clip end)
+		var endMs int64
+		if i < len(chapters)-1 {
+			endMs = chapters[i+1].OffsetMs
+		} else {
+			endMs = durationMs
+		}
+
+		fmt.Fprintf(metaFile, "[CHAPTER]\n")
+		fmt.Fprintf(metaFile, "TIMEBASE=1/1000\n")
+		fmt.Fprintf(metaFile, "START=%d\n", ch.OffsetMs)
+		fmt.Fprintf(metaFile, "END=%d\n", endMs)
+		fmt.Fprintf(metaFile, "title=%s\n\n", ch.Title)
+	}
+	metaFile.Close()
+
+	// Try NVENC first, fall back to CPU
+	err = f.extractClipWithChaptersNVENC(inputPath, metaFile.Name(), outputPath, roughSeek, fineSeek, durationSec)
+	if err == nil {
+		return nil
+	}
+
+	return f.extractClipWithChaptersCPU(inputPath, metaFile.Name(), outputPath, roughSeek, fineSeek, durationSec)
+}
+
+func (f *FFmpeg) extractClipWithChaptersNVENC(inputPath, metaFile, outputPath string, roughSeek, fineSeek, durationSec float64) error {
+	cmd := exec.Command(f.ffmpegPath,
+		"-ss", fmt.Sprintf("%.3f", roughSeek),
+		"-i", inputPath,
+		"-i", metaFile,
+		"-ss", fmt.Sprintf("%.3f", fineSeek),
+		"-t", fmt.Sprintf("%.3f", durationSec),
+		"-map", "0:v",
+		"-map", "0:a",
+		"-map_metadata", "1",
+		"-map_chapters", "1",
+		"-c:v", "h264_nvenc",
+		"-preset", "p4",
+		"-profile:v", "high",
+		"-rc", "constqp",
+		"-qp", "18",
+		"-pix_fmt", "yuv420p",
+		"-c:a", "aac",
+		"-ar", "48000",
+		"-b:a", "192k",
+		"-y",
+		outputPath,
+	)
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("nvenc failed: %s", stderr.String())
+	}
+
+	return nil
+}
+
+func (f *FFmpeg) extractClipWithChaptersCPU(inputPath, metaFile, outputPath string, roughSeek, fineSeek, durationSec float64) error {
+	cmd := exec.Command(f.ffmpegPath,
+		"-ss", fmt.Sprintf("%.3f", roughSeek),
+		"-i", inputPath,
+		"-i", metaFile,
+		"-ss", fmt.Sprintf("%.3f", fineSeek),
+		"-t", fmt.Sprintf("%.3f", durationSec),
+		"-map", "0:v",
+		"-map", "0:a",
+		"-map_metadata", "1",
+		"-map_chapters", "1",
+		"-c:v", "libx264",
+		"-preset", "medium",
+		"-profile:v", "high",
+		"-crf", "18",
+		"-pix_fmt", "yuv420p",
+		"-c:a", "aac",
+		"-ar", "48000",
+		"-b:a", "192k",
+		"-y",
+		outputPath,
+	)
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("cpu extract failed: %s", stderr.String())
+	}
+
+	return nil
+}
+
+// ExtractClipStreamCopyWithChapters extracts a clip without re-encoding but with chapter markers
+func (f *FFmpeg) ExtractClipStreamCopyWithChapters(inputPath, outputPath string, startSec, durationSec float64, chapters []ClipChapter) error {
+	// Create metadata file with chapters
+	metaFile, err := os.CreateTemp("", "ffmpeg-clip-meta-*.txt")
+	if err != nil {
+		return fmt.Errorf("failed to create metadata file: %w", err)
+	}
+	defer os.Remove(metaFile.Name())
+
+	fmt.Fprintf(metaFile, ";FFMETADATA1\n\n")
+
+	durationMs := int64(durationSec * 1000)
+	for i, ch := range chapters {
+		var endMs int64
+		if i < len(chapters)-1 {
+			endMs = chapters[i+1].OffsetMs
+		} else {
+			endMs = durationMs
+		}
+
+		fmt.Fprintf(metaFile, "[CHAPTER]\n")
+		fmt.Fprintf(metaFile, "TIMEBASE=1/1000\n")
+		fmt.Fprintf(metaFile, "START=%d\n", ch.OffsetMs)
+		fmt.Fprintf(metaFile, "END=%d\n", endMs)
+		fmt.Fprintf(metaFile, "title=%s\n\n", ch.Title)
+	}
+	metaFile.Close()
+
+	cmd := exec.Command(f.ffmpegPath,
+		"-ss", fmt.Sprintf("%.3f", startSec),
+		"-i", inputPath,
+		"-i", metaFile.Name(),
+		"-t", fmt.Sprintf("%.3f", durationSec),
+		"-map", "0:v",
+		"-map", "0:a",
+		"-map_metadata", "1",
+		"-map_chapters", "1",
+		"-c", "copy",
+		"-y",
+		outputPath,
+	)
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("ffmpeg stream copy with chapters failed: %s", stderr.String())
+	}
+
+	return nil
+}
+
 // ConcatClips concatenates multiple clips into a single output file
+// Preserves and merges chapter markers from all input clips
 func (f *FFmpeg) ConcatClips(inputPaths []string, outputPath string) error {
 	// Ensure output has .mp4 extension
 	if !strings.HasSuffix(strings.ToLower(outputPath), ".mp4") {
 		outputPath = outputPath + ".mp4"
 	}
 
-	// Create a temporary file list for concat
-	tempFile, err := os.CreateTemp("", "ffmpeg-concat-*.txt")
-	if err != nil {
-		return fmt.Errorf("failed to create temp file: %w", err)
-	}
-	defer os.Remove(tempFile.Name())
+	// Step 1: Get durations and chapters from each input clip
+	var durations []float64
+	var allChapters []ChapterInfo
+	var totalDuration float64
 
-	// Write file list
+	for i, inputPath := range inputPaths {
+		// Get duration
+		dur, err := f.GetDuration(inputPath)
+		if err != nil {
+			// If we can't get duration, fall back to simple concat without chapters
+			return f.concatClipsSimple(inputPaths, outputPath)
+		}
+		durations = append(durations, dur)
+
+		// Get chapters from this clip
+		chapters, _ := f.GetChapters(inputPath)
+
+		// Calculate time offset for this file
+		var offset float64
+		for j := 0; j < i; j++ {
+			offset += durations[j]
+		}
+
+		// If clip has no chapters, add one at the start to mark the clip boundary
+		if len(chapters) == 0 {
+			// Use filename as chapter title
+			baseName := filepath.Base(inputPath)
+			// Remove extension for cleaner title
+			title := strings.TrimSuffix(baseName, filepath.Ext(baseName))
+			allChapters = append(allChapters, ChapterInfo{
+				StartMs: int64(offset * 1000),
+				EndMs:   int64((offset + dur) * 1000),
+				Title:   title,
+			})
+		} else {
+			// Add existing chapters with offset
+			for _, ch := range chapters {
+				allChapters = append(allChapters, ChapterInfo{
+					StartMs: ch.StartMs + int64(offset*1000),
+					EndMs:   ch.EndMs + int64(offset*1000),
+					Title:   ch.Title,
+				})
+			}
+		}
+
+		totalDuration += dur
+	}
+
+	// Step 2: Create concat file list
+	concatFile, err := os.CreateTemp("", "ffmpeg-concat-*.txt")
+	if err != nil {
+		return fmt.Errorf("failed to create concat file: %w", err)
+	}
+	defer os.Remove(concatFile.Name())
+
 	for _, path := range inputPaths {
-		// Escape single quotes and backslashes for ffmpeg
 		escapedPath := strings.ReplaceAll(path, "\\", "/")
 		escapedPath = strings.ReplaceAll(escapedPath, "'", "'\\''")
-		fmt.Fprintf(tempFile, "file '%s'\n", escapedPath)
+		fmt.Fprintf(concatFile, "file '%s'\n", escapedPath)
 	}
-	tempFile.Close()
+	concatFile.Close()
 
+	// Step 3: Create metadata file with merged chapters
+	metaFile, err := os.CreateTemp("", "ffmpeg-meta-*.txt")
+	if err != nil {
+		return fmt.Errorf("failed to create metadata file: %w", err)
+	}
+	defer os.Remove(metaFile.Name())
+
+	fmt.Fprintf(metaFile, ";FFMETADATA1\n")
+	fmt.Fprintf(metaFile, "title=Combined Clips\n")
+	fmt.Fprintf(metaFile, "\n")
+
+	for _, ch := range allChapters {
+		fmt.Fprintf(metaFile, "[CHAPTER]\n")
+		fmt.Fprintf(metaFile, "TIMEBASE=1/1000\n")
+		fmt.Fprintf(metaFile, "START=%d\n", ch.StartMs)
+		fmt.Fprintf(metaFile, "END=%d\n", ch.EndMs)
+		if ch.Title != "" {
+			fmt.Fprintf(metaFile, "title=%s\n", ch.Title)
+		}
+		fmt.Fprintf(metaFile, "\n")
+	}
+	metaFile.Close()
+
+	// Step 4: Run ffmpeg with merged metadata
+	// Note: DNxHR MOV files from Shutter Encoder have unknown metadata streams (stream 3+)
+	// -err_detect ignore_err tells ffmpeg to continue despite probe warnings
+	// We use explicit stream mapping to only copy video and audio streams
 	cmd := exec.Command(f.ffmpegPath,
+		"-err_detect", "ignore_err",
 		"-f", "concat",
 		"-safe", "0",
-		"-i", tempFile.Name(),
-		"-map", "0:v",  // Only video stream
-		"-map", "0:a",  // Only audio stream
-		"-c", "copy",   // No re-encoding
+		"-i", concatFile.Name(),
+		"-i", metaFile.Name(),
+		"-map", "0:v:0", // First video stream only
+		"-map", "0:a:0", // First audio stream only
+		"-map_metadata", "1",
+		"-map_chapters", "1",
+		"-c", "copy",
 		"-y",
 		outputPath,
 	)
@@ -289,14 +562,262 @@ func (f *FFmpeg) ConcatClips(inputPaths []string, outputPath string) error {
 	return nil
 }
 
+// concatClipsSimple is a fallback that concatenates without chapter preservation
+func (f *FFmpeg) concatClipsSimple(inputPaths []string, outputPath string) error {
+	tempFile, err := os.CreateTemp("", "ffmpeg-concat-*.txt")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer os.Remove(tempFile.Name())
+
+	for _, path := range inputPaths {
+		escapedPath := strings.ReplaceAll(path, "\\", "/")
+		escapedPath = strings.ReplaceAll(escapedPath, "'", "'\\''")
+		fmt.Fprintf(tempFile, "file '%s'\n", escapedPath)
+	}
+	tempFile.Close()
+
+	cmd := exec.Command(f.ffmpegPath,
+		"-err_detect", "ignore_err",
+		"-f", "concat",
+		"-safe", "0",
+		"-i", tempFile.Name(),
+		"-map", "0:v:0",
+		"-map", "0:a:0",
+		"-c", "copy",
+		"-y",
+		outputPath,
+	)
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("ffmpeg concat failed: %s", stderr.String())
+	}
+
+	return nil
+}
+
+// ConcatClipsWithEncode combines clips with re-encoding for smaller file size
+// Preserves and merges chapter markers from all input clips
+// If forceCPU is true, uses libx264 instead of NVENC
+func (f *FFmpeg) ConcatClipsWithEncode(inputPaths []string, outputPath string, crf string, forceCPU bool) error {
+	// Ensure output has .mp4 extension
+	if !strings.HasSuffix(strings.ToLower(outputPath), ".mp4") {
+		outputPath = outputPath + ".mp4"
+	}
+
+	// Step 1: Get durations and chapters from each input clip
+	var durations []float64
+	var allChapters []ChapterInfo
+
+	for i, inputPath := range inputPaths {
+		// Get duration
+		dur, err := f.GetDuration(inputPath)
+		if err != nil {
+			dur = 0 // Continue without duration
+		}
+		durations = append(durations, dur)
+
+		// Get chapters from this clip
+		chapters, _ := f.GetChapters(inputPath)
+
+		// Calculate time offset for this file
+		var offset float64
+		for j := 0; j < i; j++ {
+			offset += durations[j]
+		}
+
+		// If clip has no chapters, add one at the start to mark the clip boundary
+		if len(chapters) == 0 {
+			title := strings.TrimSuffix(filepath.Base(inputPath), filepath.Ext(inputPath))
+			allChapters = append(allChapters, ChapterInfo{
+				StartMs: int64(offset * 1000),
+				EndMs:   int64((offset + dur) * 1000),
+				Title:   title,
+			})
+		} else {
+			// Add existing chapters with offset
+			for _, ch := range chapters {
+				allChapters = append(allChapters, ChapterInfo{
+					StartMs: ch.StartMs + int64(offset*1000),
+					EndMs:   ch.EndMs + int64(offset*1000),
+					Title:   ch.Title,
+				})
+			}
+		}
+	}
+
+	// Step 2: Create metadata file with merged chapters
+	metaFile, err := os.CreateTemp("", "ffmpeg-meta-*.txt")
+	if err != nil {
+		return fmt.Errorf("failed to create metadata file: %w", err)
+	}
+	defer os.Remove(metaFile.Name())
+
+	fmt.Fprintf(metaFile, ";FFMETADATA1\n")
+	fmt.Fprintf(metaFile, "title=Combined Clips\n")
+	fmt.Fprintf(metaFile, "\n")
+
+	for _, ch := range allChapters {
+		fmt.Fprintf(metaFile, "[CHAPTER]\n")
+		fmt.Fprintf(metaFile, "TIMEBASE=1/1000\n")
+		fmt.Fprintf(metaFile, "START=%d\n", ch.StartMs)
+		fmt.Fprintf(metaFile, "END=%d\n", ch.EndMs)
+		if ch.Title != "" {
+			fmt.Fprintf(metaFile, "title=%s\n", ch.Title)
+		}
+		fmt.Fprintf(metaFile, "\n")
+	}
+	metaFile.Close()
+
+	// Step 3: Run ffmpeg with re-encoding using filter_complex concat
+	// This avoids issues with unknown streams in DNxHR MOV files
+	if forceCPU {
+		return f.concatClipsEncodeCPU(inputPaths, metaFile.Name(), outputPath, crf)
+	}
+
+	// Try NVENC first, fall back to CPU
+	err = f.concatClipsEncodeNVENC(inputPaths, metaFile.Name(), outputPath, crf)
+	if err != nil {
+		return f.concatClipsEncodeCPU(inputPaths, metaFile.Name(), outputPath, crf)
+	}
+	return nil
+}
+
+func (f *FFmpeg) concatClipsEncodeNVENC(inputPaths []string, metaFile, outputPath, crf string) error {
+	qp := crf
+
+	// Build ffmpeg command using filter_complex concat instead of concat demuxer
+	// This avoids issues with unknown streams in DNxHR MOV files
+	args := []string{}
+
+	// Add each input file
+	for _, path := range inputPaths {
+		args = append(args, "-i", path)
+	}
+
+	// Add metadata file as last input
+	args = append(args, "-i", metaFile)
+
+	// Build filter_complex string: scale each video to 1920x1080, then concat
+	// This handles clips with different resolutions (common when extracted from different source files)
+	// Example: [0:v]scale=1920:1080:...[v0];[1:v]scale=1920:1080:...[v1];[v0][0:a][v1][1:a]concat=n=2:v=1:a=1[outv][outa]
+	filterStr := ""
+	for i := range inputPaths {
+		filterStr += fmt.Sprintf("[%d:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[v%d];", i, i)
+	}
+	// Add scaled video and audio streams to concat
+	for i := range inputPaths {
+		filterStr += fmt.Sprintf("[v%d][%d:a]", i, i)
+	}
+	filterStr += fmt.Sprintf("concat=n=%d:v=1:a=1[outv][outa]", len(inputPaths))
+
+	args = append(args,
+		"-filter_complex", filterStr,
+		"-map", "[outv]",
+		"-map", "[outa]",
+		"-map_metadata", fmt.Sprintf("%d", len(inputPaths)), // metadata file is last input
+		"-map_chapters", fmt.Sprintf("%d", len(inputPaths)),
+		"-c:v", "h264_nvenc",
+		"-preset", "p4",
+		"-profile:v", "high",
+		"-rc", "constqp",
+		"-qp", qp,
+		"-pix_fmt", "yuv420p",
+		"-c:a", "aac",
+		"-ar", "48000",
+		"-b:a", "192k",
+		"-movflags", "+faststart",
+		"-y",
+		outputPath,
+	)
+
+	cmd := exec.Command(f.ffmpegPath, args...)
+	f.currentCmd = cmd
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		if f.cancelFlag {
+			return fmt.Errorf("combine cancelled")
+		}
+		return fmt.Errorf("nvenc encode failed: %s", stderr.String())
+	}
+
+	return nil
+}
+
+func (f *FFmpeg) concatClipsEncodeCPU(inputPaths []string, metaFile, outputPath, crf string) error {
+	// Build ffmpeg command using filter_complex concat instead of concat demuxer
+	// This avoids issues with unknown streams in DNxHR MOV files
+	args := []string{}
+
+	// Add each input file
+	for _, path := range inputPaths {
+		args = append(args, "-i", path)
+	}
+
+	// Add metadata file as last input
+	args = append(args, "-i", metaFile)
+
+	// Build filter_complex string: scale each video to 1920x1080, then concat
+	// This handles clips with different resolutions (common when extracted from different source files)
+	filterStr := ""
+	for i := range inputPaths {
+		filterStr += fmt.Sprintf("[%d:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[v%d];", i, i)
+	}
+	// Add scaled video and audio streams to concat
+	for i := range inputPaths {
+		filterStr += fmt.Sprintf("[v%d][%d:a]", i, i)
+	}
+	filterStr += fmt.Sprintf("concat=n=%d:v=1:a=1[outv][outa]", len(inputPaths))
+
+	args = append(args,
+		"-filter_complex", filterStr,
+		"-map", "[outv]",
+		"-map", "[outa]",
+		"-map_metadata", fmt.Sprintf("%d", len(inputPaths)), // metadata file is last input
+		"-map_chapters", fmt.Sprintf("%d", len(inputPaths)),
+		"-c:v", "libx264",
+		"-preset", "medium",
+		"-profile:v", "high",
+		"-crf", crf,
+		"-pix_fmt", "yuv420p",
+		"-c:a", "aac",
+		"-ar", "48000",
+		"-b:a", "192k",
+		"-movflags", "+faststart",
+		"-y",
+		outputPath,
+	)
+
+	cmd := exec.Command(f.ffmpegPath, args...)
+	f.currentCmd = cmd
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		if f.cancelFlag {
+			return fmt.Errorf("combine cancelled")
+		}
+		return fmt.Errorf("cpu encode failed: %s", stderr.String())
+	}
+
+	return nil
+}
+
 // VideoMetadataInfo holds metadata information about a video file
 type VideoMetadataInfo struct {
-	HasTimecode   bool
-	Timecode      string
-	ChapterCount  int
-	HasChapters   bool
-	CreationTime  string
-	Duration      float64
+	HasTimecode  bool
+	Timecode     string
+	ChapterCount int
+	HasChapters  bool
+	CreationTime string
+	Duration     float64
 }
 
 // CheckVideoMetadata checks if a video file has preserved metadata (timecode, chapters)
@@ -475,6 +996,265 @@ func (f *FFmpeg) GetChapters(videoPath string) ([]ChapterInfo, error) {
 	return chapters, nil
 }
 
+// VideoResolution holds video dimensions
+type VideoResolution struct {
+	Width  int
+	Height int
+}
+
+// GetResolution returns the resolution of a video file
+func (f *FFmpeg) GetResolution(videoPath string) (*VideoResolution, error) {
+	cmd := exec.Command(f.ffprobePath,
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-show_entries", "stream=width,height",
+		"-of", "csv=p=0",
+		videoPath,
+	)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("ffprobe failed: %s", stderr.String())
+	}
+
+	output := strings.TrimSpace(stdout.String())
+	parts := strings.Split(output, ",")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("unexpected resolution format: %s", output)
+	}
+
+	width, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse width: %w", err)
+	}
+	height, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse height: %w", err)
+	}
+
+	return &VideoResolution{Width: width, Height: height}, nil
+}
+
+// CombineSplitGoPro combines split GoPro files into a single file
+// Uses stream copy if all files have matching dimensions, otherwise re-encodes
+// Preserves and merges chapter markers (HiLights) from all input files
+func (f *FFmpeg) CombineSplitGoPro(inputPaths []string, outputPath string) error {
+	if len(inputPaths) < 2 {
+		return fmt.Errorf("need at least 2 files to combine")
+	}
+
+	// Step 1: Check if all files have the same resolution
+	var resolutions []*VideoResolution
+	needsReencode := false
+	var targetWidth, targetHeight int
+
+	for _, inputPath := range inputPaths {
+		res, err := f.GetResolution(inputPath)
+		if err != nil {
+			// If we can't get resolution, assume we need re-encoding
+			needsReencode = true
+			break
+		}
+		resolutions = append(resolutions, res)
+	}
+
+	if !needsReencode && len(resolutions) > 0 {
+		targetWidth = resolutions[0].Width
+		targetHeight = resolutions[0].Height
+		for _, res := range resolutions[1:] {
+			if res.Width != targetWidth || res.Height != targetHeight {
+				needsReencode = true
+				// Use the largest resolution as target
+				if res.Width*res.Height > targetWidth*targetHeight {
+					targetWidth = res.Width
+					targetHeight = res.Height
+				}
+				break
+			}
+		}
+	}
+
+	// Step 2: Get durations and chapters from each file
+	var durations []float64
+	var allChapters []ChapterInfo
+
+	for i, inputPath := range inputPaths {
+		// Get duration
+		dur, err := f.GetDuration(inputPath)
+		if err != nil {
+			return fmt.Errorf("failed to get duration of %s: %w", inputPath, err)
+		}
+		durations = append(durations, dur)
+
+		// Get chapters (HiLights)
+		chapters, _ := f.GetChapters(inputPath)
+
+		// Calculate time offset for this file
+		var offset float64
+		for j := 0; j < i; j++ {
+			offset += durations[j]
+		}
+
+		// Add chapters with adjusted timestamps
+		for _, ch := range chapters {
+			allChapters = append(allChapters, ChapterInfo{
+				StartMs: ch.StartMs + int64(offset*1000),
+				EndMs:   ch.EndMs + int64(offset*1000),
+				Title:   ch.Title,
+			})
+		}
+	}
+
+	// Step 3: Create metadata file with merged chapters
+	metaFile, err := os.CreateTemp("", "ffmpeg-meta-*.txt")
+	if err != nil {
+		return fmt.Errorf("failed to create metadata file: %w", err)
+	}
+	defer os.Remove(metaFile.Name())
+
+	fmt.Fprintf(metaFile, ";FFMETADATA1\n")
+	fmt.Fprintf(metaFile, "\n")
+
+	for _, ch := range allChapters {
+		fmt.Fprintf(metaFile, "[CHAPTER]\n")
+		fmt.Fprintf(metaFile, "TIMEBASE=1/1000\n")
+		fmt.Fprintf(metaFile, "START=%d\n", ch.StartMs)
+		fmt.Fprintf(metaFile, "END=%d\n", ch.EndMs)
+		if ch.Title != "" {
+			fmt.Fprintf(metaFile, "title=%s\n", ch.Title)
+		}
+		fmt.Fprintf(metaFile, "\n")
+	}
+	metaFile.Close()
+
+	if needsReencode {
+		// Use filter_complex with scale to normalize resolutions
+		return f.combineSplitGoProReencode(inputPaths, metaFile.Name(), outputPath, targetWidth, targetHeight)
+	}
+
+	// Step 4: Stream copy (fast path for matching dimensions)
+	concatFile, err := os.CreateTemp("", "ffmpeg-concat-*.txt")
+	if err != nil {
+		return fmt.Errorf("failed to create concat file: %w", err)
+	}
+	defer os.Remove(concatFile.Name())
+
+	for _, path := range inputPaths {
+		escapedPath := strings.ReplaceAll(path, "\\", "/")
+		escapedPath = strings.ReplaceAll(escapedPath, "'", "'\\''")
+		fmt.Fprintf(concatFile, "file '%s'\n", escapedPath)
+	}
+	concatFile.Close()
+
+	cmd := exec.Command(f.ffmpegPath,
+		"-f", "concat",
+		"-safe", "0",
+		"-i", concatFile.Name(),
+		"-i", metaFile.Name(),
+		"-map", "0:v",
+		"-map", "0:a",
+		"-map_metadata", "1",
+		"-map_chapters", "1",
+		"-c", "copy", // No re-encoding
+		"-y",
+		outputPath,
+	)
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("ffmpeg combine failed: %s", stderr.String())
+	}
+
+	return nil
+}
+
+// combineSplitGoProReencode combines files with different resolutions using re-encoding
+func (f *FFmpeg) combineSplitGoProReencode(inputPaths []string, metaFile, outputPath string, targetWidth, targetHeight int) error {
+	// Build ffmpeg command with filter_complex to scale and concat
+	args := []string{}
+
+	// Add each input file
+	for _, path := range inputPaths {
+		args = append(args, "-i", path)
+	}
+
+	// Add metadata file as last input
+	args = append(args, "-i", metaFile)
+
+	// Build filter_complex: scale each input to target resolution, then concat
+	// Example: [0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2[v0];...
+	filterStr := ""
+	for i := range inputPaths {
+		filterStr += fmt.Sprintf("[%d:v]scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2,setsar=1[v%d];",
+			i, targetWidth, targetHeight, targetWidth, targetHeight, i)
+	}
+	// Add audio streams
+	for i := range inputPaths {
+		filterStr += fmt.Sprintf("[v%d][%d:a]", i, i)
+	}
+	filterStr += fmt.Sprintf("concat=n=%d:v=1:a=1[outv][outa]", len(inputPaths))
+
+	args = append(args,
+		"-filter_complex", filterStr,
+		"-map", "[outv]",
+		"-map", "[outa]",
+		"-map_metadata", fmt.Sprintf("%d", len(inputPaths)),
+		"-map_chapters", fmt.Sprintf("%d", len(inputPaths)),
+	)
+
+	// Try NVENC first, fall back to CPU
+	nvencArgs := append(args,
+		"-c:v", "h264_nvenc",
+		"-preset", "p4",
+		"-profile:v", "high",
+		"-rc", "constqp",
+		"-qp", "18",
+		"-pix_fmt", "yuv420p",
+		"-c:a", "aac",
+		"-ar", "48000",
+		"-b:a", "192k",
+		"-y",
+		outputPath,
+	)
+
+	cmd := exec.Command(f.ffmpegPath, nvencArgs...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err == nil {
+		return nil
+	}
+
+	// Fall back to CPU encoding
+	cpuArgs := append(args,
+		"-c:v", "libx264",
+		"-preset", "medium",
+		"-profile:v", "high",
+		"-crf", "18",
+		"-pix_fmt", "yuv420p",
+		"-c:a", "aac",
+		"-ar", "48000",
+		"-b:a", "192k",
+		"-y",
+		outputPath,
+	)
+
+	cmd = exec.Command(f.ffmpegPath, cpuArgs...)
+	stderr.Reset()
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("ffmpeg combine with re-encode failed: %s", stderr.String())
+	}
+
+	return nil
+}
+
 // ExportFullGame combines multiple MOV files into a single YouTube-ready video
 // with re-encoding and merged chapter markers
 // If forceCPU is true, uses libx264 instead of NVENC for better compression efficiency
@@ -534,23 +1314,8 @@ func (f *FFmpeg) ExportFullGame(inputPaths []string, outputPath string, crf stri
 		totalDuration += dur
 	}
 
-	// Step 2: Create concat file list
+	// Step 2: Create metadata file with chapters
 	progress(0.1, "Preparing files...")
-
-	concatFile, err := os.CreateTemp("", "ffmpeg-concat-*.txt")
-	if err != nil {
-		return fmt.Errorf("failed to create concat file: %w", err)
-	}
-	defer os.Remove(concatFile.Name())
-
-	for _, path := range inputPaths {
-		escapedPath := strings.ReplaceAll(path, "\\", "/")
-		escapedPath = strings.ReplaceAll(escapedPath, "'", "'\\''")
-		fmt.Fprintf(concatFile, "file '%s'\n", escapedPath)
-	}
-	concatFile.Close()
-
-	// Step 3: Create metadata file with chapters
 	metaFile, err := os.CreateTemp("", "ffmpeg-meta-*.txt")
 	if err != nil {
 		return fmt.Errorf("failed to create metadata file: %w", err)
@@ -571,19 +1336,18 @@ func (f *FFmpeg) ExportFullGame(inputPaths []string, outputPath string, crf stri
 	}
 	metaFile.Close()
 
-	// Step 4: Run ffmpeg with YouTube-optimized settings
+	// Step 4: Run ffmpeg with YouTube-optimized settings using filter_complex
+	// This handles DNxHR MOV files with unknown streams and different resolutions
 	progress(0.15, "Encoding video (this may take a while)...")
 
 	if forceCPU {
-		// User requested CPU encoding for better compression
 		progress(0.15, "Using CPU encoding for best compression...")
-		err = f.exportFullGameCPU(concatFile.Name(), metaFile.Name(), outputPath, crf)
+		err = f.exportFullGameCPU(inputPaths, metaFile.Name(), outputPath, crf)
 	} else {
-		// Try NVENC first, fall back to CPU
-		err = f.exportFullGameNVENC(concatFile.Name(), metaFile.Name(), outputPath, crf)
+		err = f.exportFullGameNVENC(inputPaths, metaFile.Name(), outputPath, crf)
 		if err != nil {
 			progress(0.15, "GPU encoding not available, using CPU...")
-			err = f.exportFullGameCPU(concatFile.Name(), metaFile.Name(), outputPath, crf)
+			err = f.exportFullGameCPU(inputPaths, metaFile.Name(), outputPath, crf)
 		}
 	}
 
@@ -595,20 +1359,37 @@ func (f *FFmpeg) ExportFullGame(inputPaths []string, outputPath string, crf stri
 	return nil
 }
 
-// exportFullGameNVENC exports using NVIDIA hardware encoding
-func (f *FFmpeg) exportFullGameNVENC(concatFile, metaFile, outputPath, crf string) error {
-	// Map CRF to NVENC QP (roughly equivalent)
-	qp := crf // QP values are similar to CRF for NVENC
+// exportFullGameNVENC exports using NVIDIA hardware encoding with filter_complex
+func (f *FFmpeg) exportFullGameNVENC(inputPaths []string, metaFile, outputPath, crf string) error {
+	qp := crf
 
-	cmd := exec.Command(f.ffmpegPath,
-		"-f", "concat",
-		"-safe", "0",
-		"-i", concatFile,
-		"-i", metaFile,
-		"-map", "0:v",
-		"-map", "0:a",
-		"-map_metadata", "1",
-		"-map_chapters", "1",
+	args := []string{}
+
+	// Add each input file
+	for _, path := range inputPaths {
+		args = append(args, "-i", path)
+	}
+
+	// Add metadata file as last input
+	args = append(args, "-i", metaFile)
+
+	// Build filter_complex: scale each video to 1920x1080, then concat
+	// This handles DNxHR MOV files with unknown streams and different resolutions
+	filterStr := ""
+	for i := range inputPaths {
+		filterStr += fmt.Sprintf("[%d:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[v%d];", i, i)
+	}
+	for i := range inputPaths {
+		filterStr += fmt.Sprintf("[v%d][%d:a]", i, i)
+	}
+	filterStr += fmt.Sprintf("concat=n=%d:v=1:a=1[outv][outa]", len(inputPaths))
+
+	args = append(args,
+		"-filter_complex", filterStr,
+		"-map", "[outv]",
+		"-map", "[outa]",
+		"-map_metadata", fmt.Sprintf("%d", len(inputPaths)),
+		"-map_chapters", fmt.Sprintf("%d", len(inputPaths)),
 		"-c:v", "h264_nvenc",
 		"-preset", "p4",
 		"-profile:v", "high",
@@ -618,32 +1399,56 @@ func (f *FFmpeg) exportFullGameNVENC(concatFile, metaFile, outputPath, crf strin
 		"-c:a", "aac",
 		"-ar", "48000",
 		"-b:a", "192k",
-		"-movflags", "+faststart", // YouTube optimization
+		"-movflags", "+faststart",
 		"-y",
 		outputPath,
 	)
+
+	cmd := exec.Command(f.ffmpegPath, args...)
+	f.currentCmd = cmd
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
+		if f.cancelFlag {
+			return fmt.Errorf("export cancelled")
+		}
 		return fmt.Errorf("nvenc export failed: %s", stderr.String())
 	}
 
 	return nil
 }
 
-// exportFullGameCPU exports using software encoding
-func (f *FFmpeg) exportFullGameCPU(concatFile, metaFile, outputPath, crf string) error {
-	cmd := exec.Command(f.ffmpegPath,
-		"-f", "concat",
-		"-safe", "0",
-		"-i", concatFile,
-		"-i", metaFile,
-		"-map", "0:v",
-		"-map", "0:a",
-		"-map_metadata", "1",
-		"-map_chapters", "1",
+// exportFullGameCPU exports using software encoding with filter_complex
+func (f *FFmpeg) exportFullGameCPU(inputPaths []string, metaFile, outputPath, crf string) error {
+	args := []string{}
+
+	// Add each input file
+	for _, path := range inputPaths {
+		args = append(args, "-i", path)
+	}
+
+	// Add metadata file as last input
+	args = append(args, "-i", metaFile)
+
+	// Build filter_complex: scale each video to 1920x1080, then concat
+	// This handles DNxHR MOV files with unknown streams and different resolutions
+	filterStr := ""
+	for i := range inputPaths {
+		filterStr += fmt.Sprintf("[%d:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[v%d];", i, i)
+	}
+	for i := range inputPaths {
+		filterStr += fmt.Sprintf("[v%d][%d:a]", i, i)
+	}
+	filterStr += fmt.Sprintf("concat=n=%d:v=1:a=1[outv][outa]", len(inputPaths))
+
+	args = append(args,
+		"-filter_complex", filterStr,
+		"-map", "[outv]",
+		"-map", "[outa]",
+		"-map_metadata", fmt.Sprintf("%d", len(inputPaths)),
+		"-map_chapters", fmt.Sprintf("%d", len(inputPaths)),
 		"-c:v", "libx264",
 		"-preset", "medium",
 		"-profile:v", "high",
@@ -652,15 +1457,21 @@ func (f *FFmpeg) exportFullGameCPU(concatFile, metaFile, outputPath, crf string)
 		"-c:a", "aac",
 		"-ar", "48000",
 		"-b:a", "192k",
-		"-movflags", "+faststart", // YouTube optimization
+		"-movflags", "+faststart",
 		"-y",
 		outputPath,
 	)
+
+	cmd := exec.Command(f.ffmpegPath, args...)
+	f.currentCmd = cmd
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
+		if f.cancelFlag {
+			return fmt.Errorf("export cancelled")
+		}
 		return fmt.Errorf("cpu export failed: %s", stderr.String())
 	}
 

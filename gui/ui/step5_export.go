@@ -18,6 +18,7 @@ import (
 func (a *App) createStep5Export() fyne.CanvasObject {
 	// MOV files list
 	var movFiles []string
+	var totalSourceDuration float64
 	movListLabel := widget.NewLabel("No MOV files detected")
 	movListLabel.Wrapping = fyne.TextWrapWord
 
@@ -25,11 +26,20 @@ func (a *App) createStep5Export() fyne.CanvasObject {
 	outputFileLabel := widget.NewLabel("(auto-generated)")
 	var outputFile string
 
-	// Status
+	// Status and progress
 	statusLabel := widget.NewLabel("")
 	statusLabel.Wrapping = fyne.TextWrapWord
+	elapsedLabel := widget.NewLabel("")
 	progressBar := widget.NewProgressBar()
 	progressBar.Hide()
+
+	// Timer control
+	var timerStop chan bool
+	var exportRunning bool
+
+	// Cancel button
+	cancelBtn := widget.NewButton("Cancel", nil)
+	cancelBtn.Hide()
 
 	// Quality preset
 	qualitySelect := widget.NewSelect([]string{
@@ -73,14 +83,14 @@ func (a *App) createStep5Export() fyne.CanvasObject {
 
 		// Build display text with durations
 		var lines []string
-		var totalDuration float64
+		totalSourceDuration = 0
 		for _, f := range movFiles {
 			dur, _ := a.ff.GetDuration(f)
-			totalDuration += dur
+			totalSourceDuration += dur
 			durStr := formatDuration(dur)
 			lines = append(lines, fmt.Sprintf("  %s (%s)", filepath.Base(f), durStr))
 		}
-		lines = append(lines, fmt.Sprintf("\nTotal: %s", formatDuration(totalDuration)))
+		lines = append(lines, fmt.Sprintf("\nTotal: %s", formatDuration(totalSourceDuration)))
 		movListLabel.SetText(strings.Join(lines, "\n"))
 	}
 
@@ -121,10 +131,22 @@ func (a *App) createStep5Export() fyne.CanvasObject {
 		}, a.window)
 	})
 
+	// Cancel button handler
+	cancelBtn.OnTapped = func() {
+		if exportRunning {
+			statusLabel.SetText("Cancelling export...")
+			a.ff.CancelExport()
+		}
+	}
+
 	exportBtn := widget.NewButton("Export Full Game", func() {
 		if len(movFiles) == 0 {
 			a.showError("No Files", "No MOV files to export. Click Refresh or select a folder.")
 			return
+		}
+
+		if exportRunning {
+			return // Already running
 		}
 
 		// Generate output filename if not set
@@ -137,6 +159,7 @@ func (a *App) createStep5Export() fyne.CanvasObject {
 		// Parse quality setting
 		crf := "20" // default balanced
 		forceCPU := false
+		encoderName := "GPU (NVENC)"
 		switch qualitySelect.Selected {
 		case "High Quality (CRF 18) - ~12 Mbps":
 			crf = "18"
@@ -147,25 +170,78 @@ func (a *App) createStep5Export() fyne.CanvasObject {
 		case "Smallest (CPU, CRF 23) - ~5 Mbps, slower":
 			crf = "23"
 			forceCPU = true
+			encoderName = "CPU (libx264)"
 		}
 
+		// Reset cancel state
+		a.ff.ResetCancel()
+		exportRunning = true
+
+		// Show UI elements
 		progressBar.Show()
 		progressBar.SetValue(0)
-		statusLabel.SetText("Exporting full game video...")
+		cancelBtn.Show()
+		elapsedLabel.SetText("")
+
+		// Build descriptive status
+		durationStr := formatDuration(totalSourceDuration)
+		statusLabel.SetText(fmt.Sprintf("Encoding %s video using %s (CRF %s)...", durationStr, encoderName, crf))
+
+		// Start elapsed time timer
+		startTime := time.Now()
+		timerStop = make(chan bool, 1)
+
+		go func() {
+			ticker := time.NewTicker(1 * time.Second)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ticker.C:
+					elapsed := time.Since(startTime)
+					fyne.Do(func() {
+						elapsedLabel.SetText(fmt.Sprintf("Elapsed: %s", formatDuration(elapsed.Seconds())))
+					})
+				case <-timerStop:
+					return
+				}
+			}
+		}()
 
 		go func() {
 			// Export with chapter preservation
 			err := a.ff.ExportFullGame(movFiles, finalOutput, crf, forceCPU, func(progress float64, status string) {
 				fyne.Do(func() {
 					progressBar.SetValue(progress)
-					statusLabel.SetText(status)
+					// Keep showing elapsed time in status
+					if progress < 1.0 && progress > 0.1 {
+						elapsed := time.Since(startTime)
+						statusLabel.SetText(fmt.Sprintf("%s (Elapsed: %s)", status, formatDuration(elapsed.Seconds())))
+					} else {
+						statusLabel.SetText(status)
+					}
 				})
 			})
 
+			// Stop the timer
+			close(timerStop)
+			exportRunning = false
+			totalElapsed := time.Since(startTime)
+
 			fyne.Do(func() {
 				progressBar.Hide()
+				cancelBtn.Hide()
+
 				if err != nil {
-					statusLabel.SetText("Error: " + err.Error())
+					if a.ff.IsCancelled() {
+						elapsedLabel.SetText(fmt.Sprintf("Cancelled after %s", formatDuration(totalElapsed.Seconds())))
+						statusLabel.SetText("Export cancelled.")
+						// Clean up partial output file
+						os.Remove(finalOutput)
+					} else {
+						elapsedLabel.SetText(fmt.Sprintf("Failed after %s", formatDuration(totalElapsed.Seconds())))
+						statusLabel.SetText("Error: " + err.Error())
+					}
 				} else {
 					// Get final file size
 					info, _ := os.Stat(finalOutput)
@@ -178,6 +254,7 @@ func (a *App) createStep5Export() fyne.CanvasObject {
 							sizeStr = fmt.Sprintf("%.0f MB", sizeMB)
 						}
 					}
+					elapsedLabel.SetText(fmt.Sprintf("Completed in %s", formatDuration(totalElapsed.Seconds())))
 					statusLabel.SetText(fmt.Sprintf("Done! Exported to:\n%s\nSize: %s", finalOutput, sizeStr))
 					a.markStepComplete(4)
 				}
@@ -222,8 +299,9 @@ func (a *App) createStep5Export() fyne.CanvasObject {
 	)
 
 	footer := container.NewVBox(
-		exportBtn,
+		container.NewHBox(exportBtn, cancelBtn),
 		progressBar,
+		elapsedLabel,
 		statusLabel,
 	)
 

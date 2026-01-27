@@ -10,6 +10,7 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 
+	"gopro-gui/ffmpeg"
 	"gopro-gui/metadata"
 )
 
@@ -146,29 +147,50 @@ func (a *App) createStep2Extract() fyne.CanvasObject {
 			return
 		}
 
+		// Detect and merge overlapping chapters to avoid repeated video content
+		// FUTURE EXTENSION (Option B): Add UI to let user choose merge vs separate
+		clipGroups := metadata.DetectOverlappingChapters(toExtract, secBefore, secAfter)
+
+		// Show overlap summary if any overlaps were detected
+		overlapSummary := metadata.GetOverlapSummary(clipGroups)
+		if overlapSummary != "" {
+			statusLabel.SetText(overlapSummary)
+		}
+
 		progressBar.Show()
 		progressBar.SetValue(0)
 		a.extractedClips = []string{}
 
 		go func() {
-			totalClips := len(toExtract)
+			totalClips := len(clipGroups)
 			completedClips := 0
 
-			for _, ch := range toExtract {
+			for _, group := range clipGroups {
 				// Capture values for this iteration
 				currentClip := completedClips + 1
-				periodName := ch.Period
-				chapterNum := ch.Number
+				periodName := group.Period
+
+				// Build status message based on whether this is a merged group
+				var statusMsg string
+				if group.IsOverlap {
+					statusMsg = fmt.Sprintf("Extracting %d/%d: %s Ch%d-%d (merged, %.1fs)...",
+						currentClip, totalClips, periodName,
+						group.PrimaryChapter.Number,
+						group.Chapters[len(group.Chapters)-1].Number,
+						group.Duration)
+				} else {
+					statusMsg = fmt.Sprintf("Extracting %d/%d: %s Ch%d...",
+						currentClip, totalClips, periodName, group.PrimaryChapter.Number)
+				}
 
 				// Update status BEFORE starting extraction
 				fyne.Do(func() {
 					progressBar.SetValue(float64(completedClips) / float64(totalClips))
-					statusLabel.SetText(fmt.Sprintf("Extracting %d/%d: %s Ch%d...",
-						currentClip, totalClips, periodName, chapterNum))
+					statusLabel.SetText(statusMsg)
 				})
 
-				// Get video file for this chapter's period
-				videoFile := a.analysisResult.GetPeriodVideoFile(ch.Period)
+				// Get video file for this group's period
+				videoFile := a.analysisResult.GetPeriodVideoFile(group.Period)
 				if videoFile == "" {
 					fyne.Do(func() {
 						statusLabel.SetText(fmt.Sprintf("Error: No video file for period %s", periodName))
@@ -176,31 +198,38 @@ func (a *App) createStep2Extract() fyne.CanvasObject {
 					continue
 				}
 
-				// Calculate clip timing
-				startSec := ch.VideoTime.Seconds() - secBefore
-				if startSec < 0 {
-					startSec = 0
+				// Use pre-calculated timing from the ClipGroup
+				startSec := group.StartTime
+				duration := group.Duration
+
+				// Get chapter markers for this clip
+				clipChapterInfo := group.GetClipChapters()
+				var chapters []ffmpeg.ClipChapter
+				for _, ch := range clipChapterInfo {
+					chapters = append(chapters, ffmpeg.ClipChapter{
+						OffsetMs: ch.OffsetMs,
+						Title:    ch.Title,
+					})
 				}
-				duration := secBefore + secAfter
 
 				// Generate output filename with appropriate extension
-				clipName := metadata.GenerateClipFilename(ch)
+				clipName := metadata.GenerateGroupFilename(group)
 				if streamCopyCheck.Checked {
 					// Change extension to .mov for stream copy
 					clipName = clipName[:len(clipName)-4] + ".mov"
 				}
 				outputFile := filepath.Join(outputFolder, clipName)
 
-				// Extract the clip using appropriate method
+				// Extract the clip with chapter markers embedded
 				var err error
 				if streamCopyCheck.Checked {
-					err = a.ff.ExtractClipStreamCopy(videoFile, outputFile, startSec, duration)
+					err = a.ff.ExtractClipStreamCopyWithChapters(videoFile, outputFile, startSec, duration, chapters)
 				} else {
-					err = a.ff.ExtractClip(videoFile, outputFile, startSec, duration)
+					err = a.ff.ExtractClipWithChapters(videoFile, outputFile, startSec, duration, chapters)
 				}
 				if err != nil {
 					fyne.Do(func() {
-						statusLabel.SetText(fmt.Sprintf("Error extracting Ch%d: %s", chapterNum, err.Error()))
+						statusLabel.SetText(fmt.Sprintf("Error extracting: %s", err.Error()))
 					})
 				} else {
 					a.extractedClips = append(a.extractedClips, outputFile)
@@ -212,7 +241,13 @@ func (a *App) createStep2Extract() fyne.CanvasObject {
 			fyne.Do(func() {
 				progressBar.SetValue(1.0)
 				progressBar.Hide()
-				statusLabel.SetText(fmt.Sprintf("Done! Extracted %d clips to %s", finalCount, outputFolder))
+				var doneMsg string
+				if overlapSummary != "" {
+					doneMsg = fmt.Sprintf("Done! Extracted %d clips (%s)", finalCount, overlapSummary)
+				} else {
+					doneMsg = fmt.Sprintf("Done! Extracted %d clips to %s", finalCount, outputFolder)
+				}
+				statusLabel.SetText(doneMsg)
 				// Mark step complete if we extracted at least one clip
 				if finalCount > 0 {
 					a.markStepComplete(1)
